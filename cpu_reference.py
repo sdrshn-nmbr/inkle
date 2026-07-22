@@ -26,6 +26,7 @@ import torch.nn.functional as functional
 from accelerate import init_empty_weights
 from checkpoint_io import NVFP4_REPOSITORY, NVFP4_REVISION, HuggingFaceSafetensorsRepository
 from huggingface_hub import hf_hub_download
+import ml_dtypes
 from tokenizers import Tokenizer
 from transformers import AutoConfig
 from transformers.models.inkling.modeling_inkling import InklingDecoderLayer, InklingExperts
@@ -41,6 +42,8 @@ E2M1_VALUES = torch.tensor(
 
 
 def to_torch(array: np.ndarray, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+    if array.dtype == np.dtype("V2"):
+        array = array.view(ml_dtypes.bfloat16)
     return torch.from_numpy(array.astype(np.float32)).to(dtype=dtype)
 
 
@@ -73,6 +76,10 @@ def decode_nvfp4(
 
 
 def compare(reference: np.ndarray, candidate: np.ndarray) -> dict[str, float]:
+    if reference.dtype == np.dtype("V2"):
+        reference = reference.view(ml_dtypes.bfloat16)
+    if candidate.dtype == np.dtype("V2"):
+        candidate = candidate.view(ml_dtypes.bfloat16)
     reference = reference.astype(np.float32).ravel()
     candidate = candidate.astype(np.float32).ravel()
     difference = candidate - reference
@@ -86,35 +93,86 @@ def compare(reference: np.ndarray, candidate: np.ndarray) -> dict[str, float]:
 
 
 class StreamingExperts(InklingExperts):
-    def __init__(self, repository: HuggingFaceSafetensorsRepository, layer_id: int) -> None:
+    def __init__(
+        self,
+        repository: HuggingFaceSafetensorsRepository,
+        layer_id: int,
+        cache_directory: Path | None,
+    ) -> None:
         torch.nn.Module.__init__(self)
         self.repository = repository
         self.layer_id = layer_id
+        self.cache_directory = cache_directory
         self.last_routes: np.ndarray | None = None
 
     def load_expert(self, expert_id: int) -> tuple[torch.Tensor, torch.Tensor]:
+        cache_path = None
+        if self.cache_directory is not None:
+            cache_path = (
+                self.cache_directory
+                / f"layer_{self.layer_id:02d}_expert_{expert_id:03d}.npz"
+            )
+            if cache_path.exists():
+                with np.load(cache_path) as bundle:
+                    cached = tuple(bundle[name].copy() for name in sorted(bundle.files))
+                if self.layer_id == 2:
+                    return to_torch(cached[0]), to_torch(cached[1])
+                w13_scale = cached[1]
+                w2_scale = cached[4]
+                if w13_scale.dtype == np.dtype("V1"):
+                    w13_scale = w13_scale.view(ml_dtypes.float8_e4m3fn)
+                if w2_scale.dtype == np.dtype("V1"):
+                    w2_scale = w2_scale.view(ml_dtypes.float8_e4m3fn)
+                return (
+                    decode_nvfp4(cached[0], w13_scale, cached[2]),
+                    decode_nvfp4(cached[3], w2_scale, cached[5]),
+                )
+
         prefix = f"model.llm.layers.{self.layer_id}.mlp.experts"
         if self.layer_id == 2:
-            w13 = deinterleave_gate_up(to_torch(self.repository.read_first_axis(f"{prefix}.w13_weight", expert_id)))
-            w2 = to_torch(self.repository.read_first_axis(f"{prefix}.w2_weight", expert_id))
-            return w13, w2
-        packed_w13 = torch.from_numpy(self.repository.read_first_axis(f"{prefix}.w13_weight", expert_id))
-        w13_scale = torch.from_numpy(
-            self.repository.read_first_axis(f"{prefix}.w13_weight.scale", expert_id).astype(np.float32)
+            w13 = deinterleave_gate_up_numpy(
+                self.repository.read_first_axis(f"{prefix}.w13_weight", expert_id)
+            )
+            w2 = self.repository.read_first_axis(f"{prefix}.w2_weight", expert_id)
+            self.save_expert(cache_path, (w13, w2))
+            return to_torch(w13), to_torch(w2)
+        packed_w13 = deinterleave_gate_up_numpy(
+            self.repository.read_first_axis(f"{prefix}.w13_weight", expert_id)
         )
-        packed_w13 = deinterleave_gate_up(packed_w13)
-        w13_scale = deinterleave_gate_up(w13_scale)
+        w13_scale = deinterleave_gate_up_numpy(
+            self.repository.read_first_axis(f"{prefix}.w13_weight.scale", expert_id)
+        )
+        w13_scale2 = self.repository.read_first_axis(
+            f"{prefix}.w13_weight.scale2", expert_id
+        )
+        packed_w2 = self.repository.read_first_axis(f"{prefix}.w2_weight", expert_id)
+        w2_scale = self.repository.read_first_axis(f"{prefix}.w2_weight.scale", expert_id)
+        w2_scale2 = self.repository.read_first_axis(f"{prefix}.w2_weight.scale2", expert_id)
+        self.save_expert(
+            cache_path,
+            (packed_w13, w13_scale, w13_scale2, packed_w2, w2_scale, w2_scale2),
+        )
         w13 = decode_nvfp4(
-            packed_w13.numpy(),
-            w13_scale.numpy(),
-            self.repository.read_first_axis(f"{prefix}.w13_weight.scale2", expert_id),
+            packed_w13,
+            w13_scale,
+            w13_scale2,
         )
         w2 = decode_nvfp4(
-            self.repository.read_first_axis(f"{prefix}.w2_weight", expert_id),
-            self.repository.read_first_axis(f"{prefix}.w2_weight.scale", expert_id),
-            self.repository.read_first_axis(f"{prefix}.w2_weight.scale2", expert_id),
+            packed_w2,
+            w2_scale,
+            w2_scale2,
         )
         return w13, w2
+
+    @staticmethod
+    def save_expert(cache_path: Path | None, values: tuple[np.ndarray, ...]) -> None:
+        if cache_path is None:
+            return
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = cache_path.with_suffix(".tmp")
+        with temporary_path.open("wb") as temporary_file:
+            np.savez(temporary_file, *values)
+        temporary_path.replace(cache_path)
 
     def forward(
         self,
@@ -137,8 +195,9 @@ class StreamingExperts(InklingExperts):
 
 
 class ReferenceCheckpoint:
-    def __init__(self) -> None:
+    def __init__(self, expert_cache_directory: Path | None) -> None:
         self.repository = HuggingFaceSafetensorsRepository(NVFP4_REPOSITORY, NVFP4_REVISION)
+        self.expert_cache_directory = expert_cache_directory
 
     def close(self) -> None:
         self.repository.close()
@@ -150,7 +209,11 @@ class ReferenceCheckpoint:
         with init_empty_weights(include_buffers=True):
             layer = InklingDecoderLayer(config, layer_id)
             if layer_id >= 2:
-                layer.mlp.experts = StreamingExperts(self.repository, layer_id)
+                layer.mlp.experts = StreamingExperts(
+                    self.repository,
+                    layer_id,
+                    self.expert_cache_directory,
+                )
         layer.to_empty(device="cpu")
         layer.to(dtype=torch.bfloat16)
         prefix = f"model.llm.layers.{layer_id}"
@@ -209,6 +272,38 @@ def rms_norm(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return (normalized * weight).to(hidden_states.dtype)
 
 
+def save_router_probe(
+    layer: InklingDecoderLayer,
+    hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor,
+    output: Path,
+) -> None:
+    residual = hidden_states
+    normalized = layer.input_layernorm(hidden_states)
+    attended, _ = layer.self_attn(
+        hidden_states=normalized,
+        attention_mask=attention_mask,
+        conv_mask=None,
+    )
+    after_attention = residual + layer.attn_sconv(attended, conv_mask=None)
+    router_input = layer.post_attention_layernorm(after_attention)
+    flat = router_input.reshape(-1, router_input.shape[-1])
+    router_logits = functional.linear(flat, layer.mlp.gate.weight)
+    routed_scores = router_logits.sigmoid()[..., : layer.mlp.gate.num_experts]
+    choice_scores = routed_scores + layer.mlp.gate.e_score_correction_bias
+    _, routed_weights, routes, shared_weights = layer.mlp.gate(router_input)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        output,
+        router_input=router_input.float().numpy(force=True),
+        router_logits=router_logits.float().numpy(force=True),
+        choice_scores=choice_scores.float().numpy(force=True),
+        routes=routes.numpy(force=True),
+        routed_weights=routed_weights.float().numpy(force=True),
+        shared_weights=shared_weights.float().numpy(force=True),
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--prompt", default="The capital of France is")
@@ -216,14 +311,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-hidden-directory", type=Path)
     parser.add_argument("--stop-after-layer", type=int, default=65)
     parser.add_argument("--output", type=Path)
-    return parser.parse_args()
+    parser.add_argument(
+        "--expert-cache-directory", type=Path, default=Path("/tmp/inkling-expert-cache")
+    )
+    parser.add_argument("--router-probe-layer", type=int)
+    parser.add_argument("--router-probe-output", type=Path)
+    args = parser.parse_args()
+    if (args.router_probe_layer is None) != (args.router_probe_output is None):
+        parser.error("--router-probe-layer and --router-probe-output must be used together")
+    if args.router_probe_layer is not None and args.router_probe_layer < 2:
+        parser.error("--router-probe-layer must select a sparse layer")
+    return args
 
 
 def main() -> None:
     args = parse_args()
     config = AutoConfig.from_pretrained(NVFP4_REPOSITORY, revision=NVFP4_REVISION).text_config
     config._attn_implementation = "eager"
-    checkpoint = ReferenceCheckpoint()
+    checkpoint = ReferenceCheckpoint(args.expert_cache_directory)
     input_ids = tokenize_prompt(args.prompt)
     embedding_rows = np.stack(
         [checkpoint.repository.read_first_axis("model.llm.embed.weight", int(token_id)) for token_id in input_ids[0]]
@@ -245,11 +350,17 @@ def main() -> None:
     with torch.inference_mode():
         for layer_id in range(args.stop_after_layer + 1):
             layer = checkpoint.load_layer(config, layer_id)
+            if args.router_probe_layer == layer_id:
+                save_router_probe(layer, hidden_states, attention_mask, args.router_probe_output)
             hidden_states = layer(hidden_states, attention_mask=attention_mask, conv_mask=None)
             reference_hidden = hidden_states.float().numpy(force=True)
             if args.save_hidden_directory is not None:
                 args.save_hidden_directory.mkdir(parents=True, exist_ok=True)
                 np.save(args.save_hidden_directory / f"layer_{layer_id:02d}_hidden.npy", reference_hidden)
+                if layer_id >= 2:
+                    (
+                        args.save_hidden_directory / f"layer_{layer_id:02d}_routes.json"
+                    ).write_text(json.dumps(layer.mlp.experts.last_routes.tolist()))
             if args.validation_directory is not None:
                 candidate_path = args.validation_directory / f"layer_{layer_id:02d}_hidden.npy"
                 if candidate_path.exists():
