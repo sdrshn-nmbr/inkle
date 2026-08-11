@@ -20,9 +20,13 @@ from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
+from jax import shard_map
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 from jax.sharding import Sharding
 
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+from sgl_jax.srt.kernels.causal_conv1d import ragged_causal_conv1d
 from sgl_jax.srt.utils.profiling_utils import named_scope
 
 # Map of supported activation names → callable. ``None`` means identity.
@@ -64,6 +68,7 @@ def short_convolution(
     activation: str | Callable[[jax.Array], jax.Array] | None = "silu",
     x_window_sharding: Sharding | None = None,
     cache_window_sharding: Sharding | None = None,
+    backend: str | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Depthwise causal conv1d with per-sequence cache.
 
@@ -88,6 +93,24 @@ def short_convolution(
 
     weight = _normalize_weight(weight)
 
+    if backend not in (None, "pallas"):
+        raise ValueError(f"INKLING_CONV_BACKEND_UNSUPPORTED backend={backend}")
+    if backend == "pallas" and jax.default_backend() == "tpu":
+        if not isinstance(x_window_sharding, NamedSharding):
+            raise ValueError(
+                "INKLING_PALLAS_CONV_SHARDING_REQUIRED "
+                f"x_window_sharding={x_window_sharding}"
+            )
+        y, new_cache = _pallas_conv(
+            x,
+            weight,
+            cache,
+            cu_seqlens,
+            bias,
+            x_window_sharding.mesh,
+        )
+        return _apply_activation(y, activation_fn), new_cache
+
     if forward_mode == ForwardMode.DECODE:
         return _decode_conv(x, weight, cache, bias, activation_fn)
     if cu_seqlens is None:
@@ -102,6 +125,86 @@ def short_convolution(
         x_window_sharding,
         cache_window_sharding,
     )
+
+
+def selected_short_convolution_backend() -> str:
+    return "pallas" if jax.default_backend() == "tpu" else "jax"
+
+
+def _pallas_conv(
+    x: jax.Array,
+    conv_kernel: jax.Array,
+    cache: jax.Array,
+    cu_seqlens: jax.Array | None,
+    bias: jax.Array | None,
+    mesh: jax.sharding.Mesh,
+) -> tuple[jax.Array, jax.Array]:
+    batch_size = cache.shape[0]
+    if cu_seqlens is None:
+        cu_seqlens = jnp.arange(batch_size + 1, dtype=jnp.int32)
+    cu_seqlens = jax.sharding.reshard(cu_seqlens, NamedSharding(mesh, P(None)))
+
+    def local_conv(
+        local_x: jax.Array,
+        local_weight: jax.Array,
+        local_cache: jax.Array,
+        local_cu_seqlens: jax.Array,
+        local_bias: jax.Array | None,
+    ) -> tuple[jax.Array, jax.Array]:
+        channel_count = local_x.shape[-1]
+        padded_channel_count = ((channel_count + 127) // 128) * 128
+        channel_padding = padded_channel_count - channel_count
+        local_x = jnp.pad(local_x, ((0, 0), (0, channel_padding)))
+        local_weight = jnp.pad(local_weight, ((0, channel_padding), (0, 0)))
+        local_cache = jnp.pad(local_cache, ((0, 0), (0, channel_padding), (0, 0)))
+        if local_bias is not None:
+            local_bias = jnp.pad(local_bias, ((0, channel_padding),))
+        state_indices = jnp.arange(batch_size, dtype=jnp.int32)
+        distribution = jnp.asarray([0, 0, batch_size], dtype=jnp.int32)
+        has_initial_state = jnp.ones((batch_size,), dtype=jnp.bool_)
+        output, new_cache = ragged_causal_conv1d(
+            x=jnp.copy(local_x),
+            conv_state=jnp.copy(jnp.swapaxes(local_cache, 1, 2)),
+            conv_weight=local_weight[:, None, :],
+            conv_bias=local_bias,
+            query_start_loc=local_cu_seqlens,
+            state_indices=state_indices,
+            distribution=distribution,
+            has_initial_state=has_initial_state,
+            kernel_size=local_weight.shape[-1],
+        )
+        return output[:, :channel_count], jnp.swapaxes(new_cache, 1, 2)[
+            :, :channel_count, :
+        ]
+
+    if bias is None:
+        return shard_map(
+            lambda local_x, local_weight, local_cache, local_cu_seqlens: local_conv(
+                local_x,
+                local_weight,
+                local_cache,
+                local_cu_seqlens,
+                None,
+            ),
+            mesh=mesh,
+            in_specs=(P("data", "tensor"), P("tensor", None), P("data", "tensor", None), P(None)),
+            out_specs=(P("data", "tensor"), P("data", "tensor", None)),
+            check_vma=False,
+        )(x, conv_kernel, cache, cu_seqlens)
+    bias = jax.sharding.reshard(bias, NamedSharding(mesh, P("tensor")))
+    return shard_map(
+        local_conv,
+        mesh=mesh,
+        in_specs=(
+            P("data", "tensor"),
+            P("tensor", None),
+            P("data", "tensor", None),
+            P(None),
+            P("tensor"),
+        ),
+        out_specs=(P("data", "tensor"), P("data", "tensor", None)),
+        check_vma=False,
+    )(x, conv_kernel, cache, cu_seqlens, bias)
 
 
 def _normalize_weight(weight: jax.Array) -> jax.Array:
@@ -214,4 +317,4 @@ def _extend_conv(
     return y, new_cache
 
 
-__all__ = ["short_convolution"]
+__all__ = ["selected_short_convolution_backend", "short_convolution"]

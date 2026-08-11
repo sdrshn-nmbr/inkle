@@ -96,6 +96,7 @@ class TestInklingLayout(unittest.TestCase):
                 jnp.asarray([3, 2], dtype=jnp.int32),
                 ForwardMode.EXTEND,
                 5,
+                MESH,
             )
         )
         projected = np.einsum("qhd,de->qhe", np.asarray(relative), np.asarray(projection))
@@ -109,8 +110,60 @@ class TestInklingLayout(unittest.TestCase):
                     expected[query, :, key] = projected[query, :, distance]
         np.testing.assert_allclose(actual, expected, rtol=0, atol=0)
 
+    def test_relative_bias_traces_with_sharded_sequence_lengths(self):
+        relative_sharding = jax.sharding.NamedSharding(
+            MESH, jax.sharding.PartitionSpec("data", None, None)
+        )
+        lengths_sharding = jax.sharding.NamedSharding(
+            MESH, jax.sharding.PartitionSpec("data")
+        )
+        output_sharding = jax.sharding.NamedSharding(
+            MESH, jax.sharding.PartitionSpec("data", None, None)
+        )
+        projection = jnp.ones((2, 4), dtype=jnp.float32)
+        prefix_lengths = jnp.zeros((2,), dtype=jnp.int32)
+
+        run_bias = jax.jit(
+            lambda relative, lengths: relative_position_bias(
+                relative,
+                projection,
+                lengths,
+                prefix_lengths,
+                lengths,
+                ForwardMode.EXTEND,
+                5,
+                MESH,
+            ),
+            in_shardings=(relative_sharding, lengths_sharding),
+            out_shardings=output_sharding,
+        )
+        result = run_bias(
+            jnp.ones((5, 2, 2), dtype=jnp.float32),
+            jnp.asarray([3, 2], dtype=jnp.int32),
+        )
+
+        self.assertEqual(result.shape, (5, 2, 5))
+
 
 class TestInklingModel(unittest.TestCase):
+    def test_padded_vocabulary_rows_are_masked_without_slicing(self):
+        model = InklingForCausalLM(
+            make_config(num_layers=1),
+            MESH,
+            dtype=jnp.bfloat16,
+        )
+
+        logits = model.logits_processor._get_logits(
+            jnp.ones((1, 32), dtype=jnp.bfloat16),
+            model.lm_head,
+        )
+
+        self.assertEqual(logits.shape, (1, 64))
+        np.testing.assert_array_equal(
+            np.asarray(logits[:, 60:], dtype=np.float32),
+            np.full((1, 4), float(jnp.finfo(jnp.bfloat16).min), dtype=np.float32),
+        )
+
     def test_local_config_preserves_released_text_shape(self):
         config = InklingConfig(
             architectures=["InklingForConditionalGeneration"],
@@ -333,6 +386,7 @@ class TestInklingModel(unittest.TestCase):
         state = jnp.zeros((2, 4, 3), dtype=jnp.float32)
         prompt_batch = SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
+            extend_prefix_lens=jnp.asarray([0], dtype=jnp.int32),
             extend_seq_lens=jnp.asarray([3], dtype=jnp.int32),
             recurrent_indices=jnp.asarray([1], dtype=jnp.int32),
         )
@@ -356,6 +410,25 @@ class TestInklingModel(unittest.TestCase):
             np.asarray(hidden[1:].T),
             rtol=0,
             atol=0,
+        )
+        repeated_prompt, _ = convolution.apply(hidden[:3], prompt_batch, state)
+        np.testing.assert_allclose(
+            np.asarray(repeated_prompt),
+            np.asarray(prompt),
+            rtol=0,
+            atol=1e-6,
+        )
+
+    def test_short_convolution_can_be_traced(self):
+        convolution = InklingShortConvolution(4, 4, MESH)
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            extend_seq_lens=jnp.asarray([4], dtype=jnp.int32),
+            recurrent_indices=None,
+        )
+
+        jax.make_jaxpr(lambda hidden: convolution.apply(hidden, batch, None)[0])(
+            jnp.ones((4, 4), dtype=jnp.bfloat16)
         )
 
     def test_dense_layer_prefill_runs_through_native_attention(self):

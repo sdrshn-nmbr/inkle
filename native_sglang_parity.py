@@ -3,6 +3,7 @@ import gc
 import json
 from pathlib import Path
 
+import chex
 import jax
 import jax.numpy as jnp
 import ml_dtypes
@@ -12,7 +13,11 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from tokenizers import Tokenizer
 
-from checkpoint_io import NVFP4_REPOSITORY, NVFP4_REVISION, HuggingFaceSafetensorsRepository
+from checkpoint_io import (
+    NVFP4_REPOSITORY,
+    NVFP4_REVISION,
+    HuggingFaceSafetensorsRepository,
+)
 from sgl_jax.srt.configs.inkling import InklingConfig
 from sgl_jax.srt.layers.attention.native_backend import NativeAttention
 from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool
@@ -28,6 +33,44 @@ CONFIG_PATH = Path(
 )
 TOKENIZER_PATH = CONFIG_PATH.with_name("tokenizer.json")
 UNPADDED_VOCABULARY_SIZE = 200058
+
+
+def replicate_kv_head_blocks(
+    value: np.ndarray,
+    *,
+    target_heads: int,
+    head_dim: int,
+    axis: int,
+) -> np.ndarray:
+    chex.assert_rank(value, 2)
+    normalized_axis = axis % value.ndim
+    source_width = value.shape[normalized_axis]
+    if source_width % head_dim != 0:
+        raise ValueError(
+            "INKLING_KV_HEAD_WIDTH_INVALID "
+            f"width={source_width} head_dim={head_dim} axis={axis}"
+        )
+    source_heads = source_width // head_dim
+    if target_heads % source_heads != 0:
+        raise ValueError(
+            "INKLING_KV_HEAD_REPLICATION_INVALID "
+            f"source_heads={source_heads} target_heads={target_heads}"
+        )
+    if source_heads == target_heads:
+        return value
+
+    head_shape = list(value.shape)
+    head_shape[normalized_axis : normalized_axis + 1] = [source_heads, head_dim]
+    replicated = np.repeat(
+        value.reshape(head_shape),
+        target_heads // source_heads,
+        axis=normalized_axis,
+    )
+    output_shape = list(value.shape)
+    output_shape[normalized_axis] = target_heads * head_dim
+    result = replicated.reshape(output_shape)
+    chex.assert_shape(result, tuple(output_shape))
+    return result
 
 
 def compare(reference: np.ndarray, candidate: np.ndarray) -> dict[str, float]:
@@ -46,8 +89,8 @@ def compare(reference: np.ndarray, candidate: np.ndarray) -> dict[str, float]:
         "max_absolute_error": float(np.max(np.abs(difference))),
         "normalized_root_mean_square_error": float(
             np.sqrt(np.mean(np.square(difference)))
-            / np.sqrt(np.mean(np.square(reference))
-        )),
+            / np.sqrt(np.mean(np.square(reference)))
+        ),
     }
 
 
@@ -78,9 +121,16 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def assign(parameter_owner: object, name: str, value: np.ndarray, sharding: NamedSharding) -> None:
+def assign(
+    parameter_owner: object, name: str, value: np.ndarray, sharding: NamedSharding
+) -> None:
     target_dtype = getattr(parameter_owner, name).value.dtype
-    array = jax.device_put(jnp.asarray(value, dtype=target_dtype), sharding)
+    host_value = np.asarray(value).astype(target_dtype, copy=False)
+    array = jax.make_array_from_callback(
+        host_value.shape,
+        sharding,
+        lambda index: host_value[index],
+    )
     setattr(parameter_owner, name, nnx.Param(array))
 
 
@@ -92,14 +142,21 @@ def load_attention_layer(
 ) -> None:
     prefix = f"model.llm.layers.{layer_id}"
     linear_weights = (
-        (layer.self_attn.q_proj, f"{prefix}.attn.wq_du.weight", (None, "tensor")),
-        (layer.self_attn.k_proj, f"{prefix}.attn.wk_dv.weight", (None, "tensor")),
-        (layer.self_attn.v_proj, f"{prefix}.attn.wv_dv.weight", (None, "tensor")),
-        (layer.self_attn.r_proj, f"{prefix}.attn.wr_du.weight", (None, "tensor")),
-        (layer.self_attn.o_proj, f"{prefix}.attn.wo_ud.weight", ("tensor", None)),
+        (layer.self_attn.q_proj, f"{prefix}.attn.wq_du.weight", (None, "tensor"), False),
+        (layer.self_attn.k_proj, f"{prefix}.attn.wk_dv.weight", (None, "tensor"), True),
+        (layer.self_attn.v_proj, f"{prefix}.attn.wv_dv.weight", (None, "tensor"), True),
+        (layer.self_attn.r_proj, f"{prefix}.attn.wr_du.weight", (None, "tensor"), False),
+        (layer.self_attn.o_proj, f"{prefix}.attn.wo_ud.weight", ("tensor", None), False),
     )
-    for owner, tensor_name, spec in linear_weights:
+    for owner, tensor_name, spec, replicate_kv_heads in linear_weights:
         weight = repository.read_tensor(tensor_name).T
+        if replicate_kv_heads:
+            weight = replicate_kv_head_blocks(
+                weight,
+                target_heads=owner.weight.value.shape[1] // layer.self_attn.head_dim,
+                head_dim=layer.self_attn.head_dim,
+                axis=1,
+            )
         assign(owner, "weight", weight, NamedSharding(mesh, P(*spec)))
         del weight
         gc.collect()
@@ -111,19 +168,32 @@ def load_attention_layer(
         (layer.post_attention_layernorm, "scale", f"{prefix}.mlp_norm.weight"),
     )
     for owner, name, tensor_name in vector_weights:
-        assign(owner, name, repository.read_tensor(tensor_name), NamedSharding(mesh, P(None)))
+        assign(
+            owner,
+            name,
+            repository.read_tensor(tensor_name),
+            NamedSharding(mesh, P(None)),
+        )
 
     convolution_weights = (
-        (layer.self_attn.k_sconv, f"{prefix}.attn.k_sconv.weight"),
-        (layer.self_attn.v_sconv, f"{prefix}.attn.v_sconv.weight"),
-        (layer.attn_sconv, f"{prefix}.attn_sconv.weight"),
-        (layer.mlp_sconv, f"{prefix}.mlp_sconv.weight"),
+        (layer.self_attn.k_sconv, f"{prefix}.attn.k_sconv.weight", True),
+        (layer.self_attn.v_sconv, f"{prefix}.attn.v_sconv.weight", True),
+        (layer.attn_sconv, f"{prefix}.attn_sconv.weight", False),
+        (layer.mlp_sconv, f"{prefix}.mlp_sconv.weight", False),
     )
-    for owner, tensor_name in convolution_weights:
+    for owner, tensor_name, replicate_kv_heads in convolution_weights:
+        weight = repository.read_tensor(tensor_name).reshape(-1, owner.kernel_size)
+        if replicate_kv_heads:
+            weight = replicate_kv_head_blocks(
+                weight,
+                target_heads=owner.hidden_size // layer.self_attn.head_dim,
+                head_dim=layer.self_attn.head_dim,
+                axis=0,
+            )
         assign(
             owner,
             "weight",
-            repository.read_tensor(tensor_name).reshape(owner.hidden_size, owner.kernel_size),
+            weight,
             NamedSharding(mesh, P("tensor", None)),
         )
 
@@ -268,11 +338,18 @@ def initial_hidden_states(
     mesh: jax.sharding.Mesh,
 ) -> tuple[np.ndarray, jax.Array]:
     tokenizer = Tokenizer.from_file(str(TOKENIZER_PATH))
-    input_ids = np.asarray(tokenizer.encode(prompt, add_special_tokens=False).ids, dtype=np.int32)
+    input_ids = np.asarray(
+        tokenizer.encode(prompt, add_special_tokens=False).ids, dtype=np.int32
+    )
     embedding = np.stack(
-        [repository.read_first_axis("model.llm.embed.weight", int(token)) for token in input_ids]
+        [
+            repository.read_first_axis("model.llm.embed.weight", int(token))
+            for token in input_ids
+        ]
     ).astype(np.float32)
-    norm_weight = repository.read_tensor("model.llm.embed_norm.weight").astype(np.float32)
+    norm_weight = repository.read_tensor("model.llm.embed_norm.weight").astype(
+        np.float32
+    )
     variance = np.mean(np.square(embedding), axis=-1, keepdims=True)
     hidden = embedding * (1.0 / np.sqrt(variance + 1e-6)) * norm_weight
     return input_ids, jax.device_put(
@@ -350,6 +427,15 @@ def run_layer(
         attended, _, _ = layer.self_attn(batch.positions, normalized, batch, pool)
         hidden_states = residual + layer.attn_sconv(attended, batch)
         normalized = layer.post_attention_layernorm(hidden_states)
+        router_logits = layer.mlp.gate(normalized)
+        routed_logits = router_logits[:, : layer.mlp.num_routed_experts]
+        choice_scores = np.asarray(
+            jax.nn.sigmoid(routed_logits.astype(jnp.float32)).astype(
+                router_logits.dtype
+            )
+            + layer.mlp.correction_bias.value.astype(router_logits.dtype),
+            dtype=np.float32,
+        )
         routes, routed_weights, shared_weights = layer.mlp.routing_weights(normalized)
         candidate_routes = np.asarray(routes)
         reference_routes = np.asarray(
@@ -375,6 +461,30 @@ def run_layer(
             ),
             "shared_weight_sum": float(np.asarray(shared_weights).sum()),
         }
+        route_score_differences = []
+        for row, (candidate_row, reference_row) in enumerate(
+            zip(candidate_routes, reference_routes)
+        ):
+            candidate_set = set(map(int, candidate_row))
+            reference_set = set(map(int, reference_row))
+            if candidate_set == reference_set:
+                continue
+            differing = sorted(candidate_set.symmetric_difference(reference_set))
+            cutoff = float(min(choice_scores[row, list(candidate_set)]))
+            route_score_differences.append(
+                {
+                    "candidate_cutoff": cutoff,
+                    "cutoff_ties": np.flatnonzero(
+                        choice_scores[row] == cutoff
+                    ).tolist(),
+                    "experts": {
+                        str(expert): float(choice_scores[row, expert])
+                        for expert in differing
+                    },
+                    "row": row,
+                }
+            )
+        result["route_score_differences"] = route_score_differences
         if args.router_only:
             return hidden_states, result
 
@@ -419,14 +529,18 @@ def compute_final_logits(
     mesh: jax.sharding.Mesh,
 ) -> tuple[np.ndarray, list[dict[str, object]]]:
     norm_weight = jax.device_put(
-        jnp.asarray(repository.read_tensor("model.llm.norm.weight"), dtype=jnp.bfloat16),
+        jnp.asarray(
+            repository.read_tensor("model.llm.norm.weight"), dtype=jnp.bfloat16
+        ),
         NamedSharding(mesh, P(None)),
     )
     last_hidden = hidden_states[-1]
     normalized = last_hidden.astype(jnp.float32) * jax.lax.rsqrt(
         jnp.mean(jnp.square(last_hidden.astype(jnp.float32))) + 1e-6
     )
-    final_hidden = (normalized * norm_weight.astype(jnp.float32)).astype(jnp.bfloat16) / 24
+    final_hidden = (normalized * norm_weight.astype(jnp.float32)).astype(
+        jnp.bfloat16
+    ) / 24
     logits = np.empty((UNPADDED_VOCABULARY_SIZE,), dtype=np.float32)
     chunk_size = 2048
     for start in range(0, UNPADDED_VOCABULARY_SIZE, chunk_size):
@@ -479,18 +593,28 @@ def main() -> None:
     config.ep_size = 1
 
     logits_result = None
-    with HuggingFaceSafetensorsRepository(NVFP4_REPOSITORY, NVFP4_REVISION) as repository:
+    with HuggingFaceSafetensorsRepository(
+        NVFP4_REPOSITORY, NVFP4_REVISION
+    ) as repository:
         if args.layer in (None, 0):
-            input_ids, hidden_states = initial_hidden_states(repository, args.prompt, mesh)
+            input_ids, hidden_states = initial_hidden_states(
+                repository, args.prompt, mesh
+            )
         else:
             input_ids = np.empty((0,), dtype=np.int32)
-            loaded_hidden = load_reference_hidden(args.reference_directory, args.layer - 1)[0]
+            loaded_hidden = load_reference_hidden(
+                args.reference_directory, args.layer - 1
+            )[0]
             hidden_states = jax.device_put(
                 loaded_hidden.astype(ml_dtypes.bfloat16),
                 NamedSharding(mesh, P("data", None)),
             )
 
-        layer_ids = range(config.text_config.num_hidden_layers) if args.all_layers else [args.layer]
+        layer_ids = (
+            range(config.text_config.num_hidden_layers)
+            if args.all_layers
+            else [args.layer]
+        )
         expert_checkpoint = InklingCheckpoint(1, args.expert_cache_directory)
         results = []
         try:
@@ -526,7 +650,9 @@ def main() -> None:
         if args.logits_output is not None:
             logits, top = compute_final_logits(repository, hidden_states, mesh)
             args.logits_output.parent.mkdir(parents=True, exist_ok=True)
-            np.savez_compressed(args.logits_output, logits=logits, top_10=json.dumps(top))
+            np.savez_compressed(
+                args.logits_output, logits=logits, top_10=json.dumps(top)
+            )
             logits_result = top
 
     if args.all_layers:
@@ -539,7 +665,9 @@ def main() -> None:
             "maximum_normalized_root_mean_square_error": max(
                 item["normalized_root_mean_square_error"] for item in comparisons
             ),
-            "same_route_sets": all(result["same_route_sets"] for result in sparse_results),
+            "same_route_sets": all(
+                result["same_route_sets"] for result in sparse_results
+            ),
             "same_routes": all(result["same_routes"] for result in sparse_results),
         }
         if logits_result is not None:

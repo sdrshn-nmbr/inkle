@@ -13,11 +13,14 @@ output on the full prefix.
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.attention.linear.short_convolution import short_convolution
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
@@ -433,6 +436,42 @@ class ShortConvolutionTest(CustomTestCase):
                 cu_seqlens=None,
                 forward_mode=ForwardMode.EXTEND,
             )
+
+    def test_pallas_dispatch_uses_explicit_mesh_while_tracing(self):
+        mesh = jax.sharding.Mesh(
+            np.asarray(jax.devices()).reshape((1, 1)),
+            ("data", "tensor"),
+        )
+        x_window_sharding = NamedSharding(mesh, P("data", None, "tensor"))
+        cache = jnp.zeros((1, 4, 2), dtype=self.dtype)
+        weight = jnp.zeros((4, 3), dtype=self.dtype)
+        cu_seqlens = jnp.asarray([0, 1], dtype=jnp.int32)
+
+        def fake_pallas(x, conv_kernel, state, lengths, bias, kernel_mesh):
+            self.assertIs(kernel_mesh, mesh)
+            return x, state
+
+        with patch(
+            "sgl_jax.srt.layers.attention.linear.short_convolution.jax.default_backend",
+            return_value="tpu",
+        ), patch(
+            "sgl_jax.srt.layers.attention.linear.short_convolution._pallas_conv",
+            side_effect=fake_pallas,
+        ) as kernel:
+            jax.make_jaxpr(
+                lambda x: short_convolution(
+                    x,
+                    weight,
+                    cache,
+                    cu_seqlens,
+                    ForwardMode.EXTEND,
+                    activation=None,
+                    x_window_sharding=x_window_sharding,
+                    backend="pallas",
+                )
+            )(jnp.zeros((1, 4), dtype=self.dtype))
+
+        kernel.assert_called_once()
 
 
 class ShortConvolutionBF16Test(ShortConvolutionTest):

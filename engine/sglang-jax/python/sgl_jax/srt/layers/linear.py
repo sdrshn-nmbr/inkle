@@ -89,6 +89,7 @@ class LinearBase(nnx.Module):
         x: jax.Array,
         *,
         out_sharding: jax.sharding.Sharding | None = None,
+        preferred_element_type: jnp.dtype | None = None,
     ) -> tuple[jax.Array, jax.Array | None]:
         """Forward pass. If ``out_sharding`` is None, falls back to the
         standard TP layout derived from ``kernel_axes`` (col-parallel →
@@ -103,7 +104,11 @@ class LinearBase(nnx.Module):
             x,
             self.weight.value,
             (((x.ndim - 1,), (0,)), ((), ())),
-            preferred_element_type=self.params_dtype,
+            preferred_element_type=(
+                self.params_dtype
+                if preferred_element_type is None
+                else preferred_element_type
+            ),
             out_sharding=target,
         )
         if self.skip_bias_add:

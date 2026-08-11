@@ -249,10 +249,17 @@ class LogitsMetadata:
 class LogitsProcessor(nnx.Module):
     """Logits processor for the model."""
 
-    def __init__(self, vocab_size: int, mesh: Mesh, soft_cap: float | None = None):
+    def __init__(
+        self,
+        vocab_size: int,
+        mesh: Mesh,
+        soft_cap: float | None = None,
+        mask_padded_vocab: bool = False,
+    ):
         self.vocab_size = vocab_size
         self.soft_cap = soft_cap
         self.mesh = mesh
+        self.mask_padded_vocab = mask_padded_vocab
 
     def _select_hidden_states(self, hidden_states: jax.Array, indices: jax.Array) -> jax.Array:
         def select_local_fn(local_states, local_indices):
@@ -537,7 +544,23 @@ class LogitsProcessor(nnx.Module):
             hidden_states, embedding.T, out_sharding=NamedSharding(self.mesh, P("data", "tensor"))
         )
 
-        logits = logits[:, : self.vocab_size] if logits.ndim > 1 else logits[: self.vocab_size]
+        if self.mask_padded_vocab and self.vocab_size < logits.shape[-1]:
+            token_ids = jnp.arange(
+                logits.shape[-1],
+                dtype=jnp.int32,
+                out_sharding=NamedSharding(self.mesh, P("tensor")),
+            )
+            logits = jnp.where(
+                token_ids < self.vocab_size,
+                logits,
+                jnp.asarray(jnp.finfo(logits.dtype).min, dtype=logits.dtype),
+            )
+        else:
+            logits = (
+                logits[:, : self.vocab_size]
+                if logits.ndim > 1
+                else logits[: self.vocab_size]
+            )
 
         if self.soft_cap:
             logits = self.soft_cap * jnp.tanh(logits / self.soft_cap)

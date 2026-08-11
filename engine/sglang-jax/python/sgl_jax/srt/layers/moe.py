@@ -40,10 +40,12 @@ class EPMoE(nnx.Module):
         quantization_config=None,
         physical_to_logical_map: "jax.Array | None" = None,
         pre_gather_quant_dtype=None,
+        preferred_element_type: jnp.dtype | None = None,
     ):
         self.num_experts_per_tok = num_experts_per_tok
         self.physical_to_logical_map = physical_to_logical_map
         self.pre_gather_quant_dtype = pre_gather_quant_dtype
+        self.preferred_element_type = preferred_element_type or dtype
 
         metadata = get_global_expert_location_metadata()
         if metadata is not None and layer_id is not None:
@@ -612,7 +614,7 @@ class EPMoE(nnx.Module):
 
         gmm_kwargs = dict(
             group_sizes=group_sizes,
-            preferred_element_type=self.dtype,
+            preferred_element_type=self.preferred_element_type,
             group_offset=group_offset,
             maybe_quantize_lhs=act_q_dtype is not None,
             acc_dtype=jnp.float32,

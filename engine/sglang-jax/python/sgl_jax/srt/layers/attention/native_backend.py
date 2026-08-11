@@ -262,7 +262,12 @@ def forward_attention(
         scale = 1.0 / jnp.sqrt(head_dim)
     # (Q, H, K) layout: avoids broadcasting K-axis sharding into the Q-axis position
     # under Explicit-axis mesh + DP-sharded q_heads.
-    attn_logits = jnp.einsum("qhd,khd->qhk", q_heads, k_heads) * scale
+    attn_logits = jnp.einsum(
+        "qhd,khd->qhk",
+        q_heads,
+        k_heads,
+        preferred_element_type=jnp.float32,
+    ) * scale
     if (relative_states is None) != (relative_projection is None):
         raise ValueError(
             "INKLING_RELATIVE_BIAS_INCOMPLETE relative_states and relative_projection "
@@ -277,6 +282,7 @@ def forward_attention(
             extend_seq_lens,
             mode,
             k_heads.shape[0],
+            mesh,
         ).astype(attn_logits.dtype)
     neg_inf = jnp.asarray(jnp.finfo(attn_logits.dtype).min, attn_logits.dtype)
     # Reshard `loc` to replicated so the K-axis broadcast doesn't re-introduce
@@ -344,7 +350,12 @@ def forward_attention(
         attn_weights = attn_weights.astype(v_heads.dtype)
 
     # attn_output: [num_tokens, num_heads, v_head_dim]
-    attn_output = jnp.einsum("qhk,khd->qhd", attn_weights, v_heads)
+    attn_output = jnp.einsum(
+        "qhk,khd->qhd",
+        attn_weights,
+        v_heads,
+        preferred_element_type=jnp.float32,
+    ).astype(v_heads.dtype)
 
     # Use v_head_dim from V (may differ from head_dim for split K/V models)
     v_head_dim = v_heads.shape[-1]
@@ -359,27 +370,49 @@ def relative_position_bias(
     extend_seq_lens: jax.Array,
     mode: ForwardMode,
     key_len: int,
+    mesh: Mesh,
 ) -> jax.Array:
+    metadata_sharding = NamedSharding(mesh, P())
+    seq_lengths = jax.sharding.reshard(seq_lengths, metadata_sharding)
+    extend_prefix_lens = jax.sharding.reshard(
+        extend_prefix_lens, metadata_sharding
+    )
+    extend_seq_lens = jax.sharding.reshard(extend_seq_lens, metadata_sharding)
     query_len = relative_states.shape[0]
     key_starts = jnp.cumsum(seq_lengths, dtype=jnp.int32) - seq_lengths
-    key_markers = jnp.zeros((key_len,), dtype=jnp.int32).at[key_starts].set(1)
+    key_markers = jnp.zeros(
+        (key_len,), dtype=jnp.int32, out_sharding=metadata_sharding
+    ).at[key_starts].set(1)
     key_batch_ids = jnp.cumsum(key_markers, dtype=jnp.int32) - 1
-    key_positions = jnp.arange(key_len, dtype=jnp.int32) - key_starts[key_batch_ids]
+    key_positions = jnp.arange(
+        key_len, dtype=jnp.int32, out_sharding=metadata_sharding
+    ) - key_starts[key_batch_ids]
 
     if mode == ForwardMode.EXTEND:
         query_starts = jnp.cumsum(extend_seq_lens, dtype=jnp.int32) - extend_seq_lens
-        query_markers = jnp.zeros((query_len,), dtype=jnp.int32).at[query_starts].set(1)
+        query_markers = jnp.zeros(
+            (query_len,), dtype=jnp.int32, out_sharding=metadata_sharding
+        ).at[query_starts].set(1)
         query_batch_ids = jnp.cumsum(query_markers, dtype=jnp.int32) - 1
         query_positions = (
-            jnp.arange(query_len, dtype=jnp.int32)
+            jnp.arange(
+                query_len, dtype=jnp.int32, out_sharding=metadata_sharding
+            )
             - query_starts[query_batch_ids]
             + extend_prefix_lens[query_batch_ids]
         )
     else:
-        query_batch_ids = jnp.arange(query_len, dtype=jnp.int32)
+        query_batch_ids = jnp.arange(
+            query_len, dtype=jnp.int32, out_sharding=metadata_sharding
+        )
         query_positions = seq_lengths[:query_len] - 1
 
-    projected = jnp.einsum("qhd,de->qhe", relative_states, projection)
+    projected = jnp.einsum(
+        "qhd,de->qhe",
+        relative_states,
+        projection,
+        preferred_element_type=jnp.float32,
+    )
     distance = query_positions[:, None] - key_positions[None, :]
     extent = projection.shape[-1]
     gather_indices = jnp.clip(distance, 0, extent - 1)[:, None, :]

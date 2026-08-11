@@ -60,6 +60,27 @@ def split_interleaved_gate_up(
     return gate, up
 
 
+def get_recurrent_state_row(
+    state_table: jax.Array,
+    row: int,
+    mesh: jax.sharding.Mesh,
+) -> jax.Array:
+    return state_table.at[row].get(
+        out_sharding=NamedSharding(mesh, P("tensor", None))
+    )
+
+
+def stable_bfloat16_linear(
+    linear: LinearBase,
+    hidden_states: jax.Array,
+) -> jax.Array:
+    output, _ = linear(
+        hidden_states,
+        preferred_element_type=jnp.float32,
+    )
+    return output.astype(hidden_states.dtype)
+
+
 class InklingShortConvolution(nnx.Module):
     def __init__(
         self,
@@ -113,6 +134,21 @@ class InklingShortConvolution(nnx.Module):
             cache = state_table.at[state_indices].get(
                 out_sharding=state_sharding
             ).astype(jnp.float32)
+            if forward_batch.forward_mode == ForwardMode.EXTEND:
+                prefix_lengths = forward_batch.extend_prefix_lens
+                if prefix_lengths is None:
+                    prefix_lengths = jnp.zeros_like(
+                        forward_batch.extend_seq_lens
+                    )
+                prefix_lengths = jax.sharding.reshard(
+                    prefix_lengths,
+                    NamedSharding(self.mesh, P("data")),
+                )
+                cache = jnp.where(
+                    prefix_lengths[:, None, None] > 0,
+                    cache,
+                    jnp.zeros_like(cache),
+                )
             sequence_lengths = (
                 forward_batch.extend_seq_lens
                 if forward_batch.forward_mode == ForwardMode.EXTEND
@@ -126,10 +162,10 @@ class InklingShortConvolution(nnx.Module):
                     jnp.cumsum(sequence_lengths, dtype=sequence_lengths.dtype),
                 )
             )
-        input_sharding = hidden_states.sharding
+        input_sharding = NamedSharding(self.mesh, P("data", "tensor"))
         convolution_input = jax.sharding.reshard(
             hidden_states.astype(jnp.float32),
-            NamedSharding(self.mesh, P("data", "tensor")),
+            input_sharding,
         )
         convolved, new_cache = short_convolution(
             convolution_input,
@@ -140,6 +176,7 @@ class InklingShortConvolution(nnx.Module):
             activation=None,
             x_window_sharding=NamedSharding(self.mesh, P("data", None, "tensor")),
             cache_window_sharding=NamedSharding(self.mesh, P("data", "tensor", None)),
+            backend="pallas",
         )
         new_state_table = None
         if state_table is not None:
@@ -149,7 +186,7 @@ class InklingShortConvolution(nnx.Module):
                 out_sharding=state_sharding,
             )
             new_state_table = new_state_table.at[0].set(
-                state_table[0],
+                get_recurrent_state_row(state_table, 0, self.mesh),
                 out_sharding=state_sharding,
             )
         output = (convolved + convolution_input).astype(hidden_states.dtype)
@@ -187,9 +224,9 @@ class InklingDenseMLP(nnx.Module):
         self.mesh = mesh
 
     def __call__(self, hidden_states: jax.Array) -> jax.Array:
-        gate_up, _ = self.w13(hidden_states)
+        gate_up = stable_bfloat16_linear(self.w13, hidden_states)
         gate, up = split_interleaved_gate_up(gate_up, self.mesh)
-        output, _ = self.w2(jax.nn.silu(gate) * up)
+        output = stable_bfloat16_linear(self.w2, jax.nn.silu(gate) * up)
         return output * self.global_scale.value.astype(output.dtype)
 
 
@@ -219,10 +256,15 @@ class InklingSharedExperts(nnx.Module):
         )
 
     def __call__(self, hidden_states: jax.Array, weights: jax.Array) -> jax.Array:
+        token_count = hidden_states.shape[0]
+        token_padding = (-token_count) % 8
+        hidden_states = jnp.pad(hidden_states, ((0, token_padding), (0, 0)))
+        weights = jnp.pad(weights, ((0, token_padding), (0, 0)))
         gate_up = jnp.einsum(
             "th,ehi->tei",
             hidden_states,
             self.w13.value,
+            preferred_element_type=jnp.float32,
             out_sharding=NamedSharding(self.mesh, P("data", None, "tensor")),
         )
         gate, up = split_interleaved_gate_up(gate_up, self.mesh)
@@ -231,10 +273,14 @@ class InklingSharedExperts(nnx.Module):
             "tei,eih->teh",
             activated,
             self.w2.value,
+            preferred_element_type=jnp.float32,
             out_sharding=NamedSharding(self.mesh, P("data", None, None)),
         )
         output = output * weights[..., None].astype(output.dtype)
-        return jnp.sum(output.astype(jnp.float32), axis=1).astype(hidden_states.dtype)
+        output = jnp.sum(output.astype(jnp.float32), axis=1).astype(hidden_states.dtype)
+        return output.at[:token_count].get(
+            out_sharding=NamedSharding(self.mesh, P("data", None))
+        )
 
 
 class InklingMoE(nnx.Module):
@@ -288,6 +334,7 @@ class InklingMoE(nnx.Module):
             dtype=dtype,
             activation="silu",
             layer_id=layer_id,
+            preferred_element_type=jnp.float32,
         )
         self.shared_experts = InklingSharedExperts(
             hidden_size=config.hidden_size,
@@ -450,10 +497,10 @@ class InklingAttention(nnx.Module):
         convolution_states: tuple[jax.Array, jax.Array] | None = None,
     ) -> tuple[jax.Array, jax.Array, tuple[jax.Array, jax.Array] | None]:
         token_count = hidden_states.shape[0]
-        query, _ = self.q_proj(hidden_states)
-        key, _ = self.k_proj(hidden_states)
-        value, _ = self.v_proj(hidden_states)
-        relative, _ = self.r_proj(hidden_states)
+        query = stable_bfloat16_linear(self.q_proj, hidden_states)
+        key = stable_bfloat16_linear(self.k_proj, hidden_states)
+        value = stable_bfloat16_linear(self.v_proj, hidden_states)
+        relative = stable_bfloat16_linear(self.r_proj, hidden_states)
         key_state = convolution_states[0] if convolution_states is not None else None
         value_state = convolution_states[1] if convolution_states is not None else None
         key, new_key_state = self.k_sconv.apply(key, forward_batch, key_state)
@@ -481,7 +528,7 @@ class InklingAttention(nnx.Module):
             relative_states=relative,
             relative_projection=self.relative_projection,
         )
-        output, _ = self.o_proj(attended)
+        output = stable_bfloat16_linear(self.o_proj, attended)
         state_updates = None
         if convolution_states is not None:
             state_updates = (new_key_state, new_value_state)
@@ -672,6 +719,7 @@ class InklingForCausalLM(nnx.Module):
             self.text_config.unpadded_vocab_size,
             mesh=mesh,
             soft_cap=self.text_config.final_logit_softcapping,
+            mask_padded_vocab=True,
         )
 
     def __call__(
