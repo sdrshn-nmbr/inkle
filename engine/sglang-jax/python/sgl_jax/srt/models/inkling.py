@@ -65,9 +65,7 @@ def get_recurrent_state_row(
     row: int,
     mesh: jax.sharding.Mesh,
 ) -> jax.Array:
-    return state_table.at[row].get(
-        out_sharding=NamedSharding(mesh, P("tensor", None))
-    )
+    return state_table.at[row].get(out_sharding=NamedSharding(mesh, P("tensor", None)))
 
 
 def stable_bfloat16_linear(
@@ -131,15 +129,13 @@ class InklingShortConvolution(nnx.Module):
                 forward_batch.recurrent_indices,
                 NamedSharding(self.mesh, P("data")),
             )
-            cache = state_table.at[state_indices].get(
-                out_sharding=state_sharding
-            ).astype(jnp.float32)
+            cache = (
+                state_table.at[state_indices].get(out_sharding=state_sharding).astype(jnp.float32)
+            )
             if forward_batch.forward_mode == ForwardMode.EXTEND:
                 prefix_lengths = forward_batch.extend_prefix_lens
                 if prefix_lengths is None:
-                    prefix_lengths = jnp.zeros_like(
-                        forward_batch.extend_seq_lens
-                    )
+                    prefix_lengths = jnp.zeros_like(forward_batch.extend_seq_lens)
                 prefix_lengths = jax.sharding.reshard(
                     prefix_lengths,
                     NamedSharding(self.mesh, P("data")),
@@ -278,9 +274,7 @@ class InklingSharedExperts(nnx.Module):
         )
         output = output * weights[..., None].astype(output.dtype)
         output = jnp.sum(output.astype(jnp.float32), axis=1).astype(hidden_states.dtype)
-        return output.at[:token_count].get(
-            out_sharding=NamedSharding(self.mesh, P("data", None))
-        )
+        return output.at[:token_count].get(out_sharding=NamedSharding(self.mesh, P("data", None)))
 
 
 class InklingMoE(nnx.Module):
@@ -313,9 +307,7 @@ class InklingMoE(nnx.Module):
                 out_sharding=P(None, None),
             )
         )
-        self.correction_bias = nnx.Param(
-            jnp.zeros((self.num_routed_experts,), dtype=dtype)
-        )
+        self.correction_bias = nnx.Param(jnp.zeros((self.num_routed_experts,), dtype=dtype))
         self.global_scale = nnx.Param(jnp.ones((), dtype=dtype))
         self.topk = TopK(
             topk=self.num_experts_per_tok,
@@ -352,12 +344,9 @@ class InklingMoE(nnx.Module):
         router_logits = self.gate(hidden_states)
         routed_logits = router_logits[:, : self.num_routed_experts]
         if topk_ids is None:
-            choice_scores = (
-                jax.nn.sigmoid(routed_logits.astype(jnp.float32)).astype(
-                    router_logits.dtype
-                )
-                + self.correction_bias.value.astype(router_logits.dtype)
-            )
+            choice_scores = jax.nn.sigmoid(routed_logits.astype(jnp.float32)).astype(
+                router_logits.dtype
+            ) + self.correction_bias.value.astype(router_logits.dtype)
             _, topk_ids = self.topk(choice_scores)
         chosen_logits = jnp.take_along_axis(routed_logits, topk_ids, axis=-1)
         shared_logits = router_logits[:, self.num_routed_experts :]
@@ -455,12 +444,8 @@ class InklingAttention(nnx.Module):
             kernel_axes=("tensor", None),
             scope_name="o_proj",
         )
-        self.q_norm = RMSNorm(
-            self.head_dim, epsilon=config.rms_norm_eps, param_dtype=dtype
-        )
-        self.k_norm = RMSNorm(
-            self.head_dim, epsilon=config.rms_norm_eps, param_dtype=dtype
-        )
+        self.q_norm = RMSNorm(self.head_dim, epsilon=config.rms_norm_eps, param_dtype=dtype)
+        self.k_norm = RMSNorm(self.head_dim, epsilon=config.rms_norm_eps, param_dtype=dtype)
         self.relative_projection = nnx.Param(
             jnp.zeros(
                 (self.relative_dimension, self.relative_extent),
@@ -557,9 +542,7 @@ class InklingDecoderLayer(nnx.Module):
         self.attn_sconv = InklingShortConvolution(
             config.hidden_size, config.sconv_kernel_size, mesh
         )
-        self.mlp_sconv = InklingShortConvolution(
-            config.hidden_size, config.sconv_kernel_size, mesh
-        )
+        self.mlp_sconv = InklingShortConvolution(config.hidden_size, config.sconv_kernel_size, mesh)
         if self.is_dense:
             self.mlp = InklingDenseMLP(
                 config.hidden_size, config.dense_intermediate_size, mesh, dtype
@@ -611,9 +594,7 @@ class InklingDecoderLayer(nnx.Module):
                 NamedSharding(self.mesh, P("data", None)),
             )
         mlp_state = convolution_states[3] if convolution_states is not None else None
-        convolved_mlp, new_mlp_state = self.mlp_sconv.apply(
-            transformed, forward_batch, mlp_state
-        )
+        convolved_mlp, new_mlp_state = self.mlp_sconv.apply(transformed, forward_batch, mlp_state)
         hidden_states = residual + convolved_mlp
         state_updates = None
         if convolution_states is not None:
@@ -652,9 +633,7 @@ class InklingModel(nnx.Module):
                 for layer_id in range(config.num_hidden_layers)
             ]
         )
-        self.norm = RMSNorm(
-            config.hidden_size, epsilon=config.rms_norm_eps, param_dtype=dtype
-        )
+        self.norm = RMSNorm(config.hidden_size, epsilon=config.rms_norm_eps, param_dtype=dtype)
 
     def __call__(
         self, forward_batch: ForwardBatch, memory_pools: MemoryPools
@@ -728,9 +707,7 @@ class InklingForCausalLM(nnx.Module):
         memory_pools: MemoryPools,
         logits_metadata: LogitsMetadata,
     ):
-        hidden_states, pool_updates, layers_topk_ids = self.model(
-            forward_batch, memory_pools
-        )
+        hidden_states, pool_updates, layers_topk_ids = self.model(forward_batch, memory_pools)
         hidden_states = hidden_states / float(self.text_config.logits_mup_width_multiplier)
         output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
         return (
@@ -905,9 +882,7 @@ class InklingForCausalLM(nnx.Module):
             expert_start, expert_stop = _slice_bounds(
                 expert_slice, self.text_config.n_routed_experts
             )
-            hidden_start, hidden_stop = _slice_bounds(
-                hidden_slice, self.text_config.hidden_size
-            )
+            hidden_start, hidden_stop = _slice_bounds(hidden_slice, self.text_config.hidden_size)
             intermediate_start, intermediate_stop = _slice_bounds(
                 intermediate_slice, self.text_config.intermediate_size
             )
@@ -935,9 +910,7 @@ class InklingForCausalLM(nnx.Module):
             intermediate_start, intermediate_stop = _slice_bounds(
                 intermediate_slice, self.text_config.intermediate_size
             )
-            hidden_start, hidden_stop = _slice_bounds(
-                hidden_slice, self.text_config.hidden_size
-            )
+            hidden_start, hidden_stop = _slice_bounds(hidden_slice, self.text_config.hidden_size)
             if hidden_start != 0 or hidden_stop != self.text_config.hidden_size:
                 raise ValueError(
                     "INKLING_EXPERT_OUTPUT_SHARD_UNSUPPORTED "

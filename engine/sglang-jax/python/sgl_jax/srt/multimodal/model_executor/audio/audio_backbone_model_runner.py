@@ -104,7 +104,10 @@ class AudioBackboneModelRunner(BaseModelRunner):
         from sgl_jax.srt.layers.attention.native_backend import NativeAttention
 
         self.attn_backend = NativeAttention(
-            self.model_config.num_attention_heads, self.model_config.num_key_value_heads, self.mesh
+            self.model_config.num_attention_heads,
+            self.model_config.num_key_value_heads,
+            self.page_size,
+            self.mesh,
         )
 
     def init_memory_pool(self):

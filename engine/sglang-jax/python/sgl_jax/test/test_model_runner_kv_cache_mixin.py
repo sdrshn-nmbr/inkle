@@ -1,4 +1,5 @@
 import types
+from unittest.mock import patch
 
 import pytest
 
@@ -52,3 +53,27 @@ def test_recurrent_admission_cap_already_aligned_unchanged():
     # 16 // 2 = 8 is already a dp_size=4 multiple.
     cap = ModelRunnerKVCacheMixin._resolve_max_num_reqs(_fake_runner(16, 4), 1000)
     assert cap == 8
+
+
+def test_disable_radix_max_running_is_operator_sized_recurrent_pool():
+    server_args = ServerArgs(
+        model_path="dummy",
+        disable_radix_cache=True,
+        max_running_requests=16,
+    )
+    runner = types.SimpleNamespace(
+        attention_tp_size=8,
+        dp_size=1,
+        linear_recurrent_config=object(),
+        server_args=server_args,
+    )
+    with patch(
+        "sgl_jax.srt.model_executor.model_runner_kv_cache_mixin."
+        "_per_req_state_bytes_from_config",
+        return_value=1024,
+    ):
+        remaining = ModelRunnerKVCacheMixin.handle_recurrent_cache(runner, 1 << 20)
+
+    assert remaining == (1 << 20) - 16 * 1024
+    assert runner.recurrent_size_user_supplied is True
+    assert server_args.max_recurrent_state_size == 16

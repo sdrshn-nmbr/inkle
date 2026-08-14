@@ -400,7 +400,9 @@ class ModelRunnerKVCacheMixin:
         per_req_state = _per_req_state_bytes_from_config(cfg, self.attention_tp_size)
         factor = reservation_slots_per_request(sa)
         # Operator-set (priority 1/2) vs ratio-derived (priority 3) pool size.
-        self.recurrent_size_user_supplied = sa.max_recurrent_state_size is not None
+        self.recurrent_size_user_supplied = sa.max_recurrent_state_size is not None or (
+            sa.disable_radix_cache and sa.max_running_requests is not None
+        )
 
         if sa.max_recurrent_state_size is not None:
             assert sa.max_recurrent_state_size % dp_size == 0, (

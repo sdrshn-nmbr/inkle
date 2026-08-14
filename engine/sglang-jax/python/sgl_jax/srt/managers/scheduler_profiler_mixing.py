@@ -12,6 +12,34 @@ from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 logger = logging.getLogger(__name__)
 
 
+def _build_profiler_options(
+    host_tracer_level: int | None,
+    python_tracer_level: int | None,
+    platform: str | None = None,
+) -> jax.profiler.ProfileOptions:
+    options = jax.profiler.ProfileOptions()
+    options.raise_error_on_start_failure = True
+    if host_tracer_level is not None:
+        options.host_tracer_level = host_tracer_level
+    if python_tracer_level is not None:
+        options.python_tracer_level = python_tracer_level
+
+    if (platform or jax.default_backend()) == "tpu":
+        if os.getenv("SGLANG_TPU_PROFILE_ENABLE_HLO_PROTO") == "1":
+            options.enable_hlo_proto = True
+
+        advanced_configuration = {}
+        if trace_mode := os.getenv("SGLANG_TPU_TRACE_MODE"):
+            advanced_configuration["tpu_trace_mode"] = trace_mode
+        if chip_count := os.getenv("SGLANG_TPU_PROFILE_CHIP_COUNT"):
+            advanced_configuration["tpu_num_chips_to_profile_per_task"] = int(chip_count)
+        if os.getenv("SGLANG_TPU_PERF_COUNTERS") == "1":
+            advanced_configuration["tpu_perf_counters"] = True
+        if advanced_configuration:
+            options.advanced_configuration = advanced_configuration
+    return options
+
+
 def _get_stage_from_forward_mode(forward_mode: ForwardMode) -> str | None:
     if forward_mode.is_prefill():
         return "prefill"
@@ -130,11 +158,10 @@ class _ProfileManager:
         Path(stage_dir).mkdir(parents=True, exist_ok=True)
         logger.info("Stage-based profiling: starting trace for '%s' -> %s", stage, stage_dir)
 
-        profiler_options = jax.profiler.ProfileOptions()
-        if self._host_tracer_level:
-            profiler_options.host_tracer_level = self._host_tracer_level
-        if self._python_tracer_level:
-            profiler_options.python_tracer_level = self._python_tracer_level
+        profiler_options = _build_profiler_options(
+            self._host_tracer_level,
+            self._python_tracer_level,
+        )
 
         jax.profiler.start_trace(stage_dir, profiler_options=profiler_options)
         self._trace_active = True
@@ -212,11 +239,10 @@ class SchedulerProfilerMixin:
             self.profile_id,
         )
 
-        profiler_options = jax.profiler.ProfileOptions()
-        if host_tracer_level:
-            profiler_options.host_tracer_level = host_tracer_level
-        if python_tracer_level:
-            profiler_options.python_tracer_level = python_tracer_level
+        profiler_options = _build_profiler_options(
+            host_tracer_level,
+            python_tracer_level,
+        )
 
         print(f"profiler_options: {profiler_options}")
 

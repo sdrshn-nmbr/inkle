@@ -19,6 +19,7 @@ class NativeAttention(AttentionBackend):
         self,
         num_attn_heads,
         num_kv_heads,
+        page_size,
         mesh,
     ):
         self.num_heads = num_attn_heads
@@ -26,6 +27,7 @@ class NativeAttention(AttentionBackend):
             self.num_kv_heads = num_kv_heads
         else:
             self.num_kv_heads = num_attn_heads
+        self.page_size = page_size
         self.mesh = mesh
         self.kv_sharding = NamedSharding(self.mesh, P(None, "tensor", None))
 
@@ -34,6 +36,7 @@ class NativeAttention(AttentionBackend):
         aux_data = {
             "num_heads": self.num_heads,
             "num_kv_heads": self.num_kv_heads,
+            "page_size": self.page_size,
             "mesh": self.mesh,
         }
         return (children, aux_data)
@@ -43,6 +46,7 @@ class NativeAttention(AttentionBackend):
         return cls(
             num_attn_heads=aux_data["num_heads"],
             num_kv_heads=aux_data["num_kv_heads"],
+            page_size=aux_data["page_size"],
             mesh=aux_data["mesh"],
         )
 
@@ -96,12 +100,18 @@ class NativeAttention(AttentionBackend):
         if hasattr(relative_projection, "value"):
             relative_projection = relative_projection.value
 
+        cache_loc = compact_page_aligned_cache_loc(
+            forward_batch.cache_loc,
+            forward_batch.seq_lens,
+            self.page_size,
+            self.mesh,
+        )
         attn_output = forward_attention(
             q,
             k_buffer,
             v_buffer,
             forward_batch.seq_lens,
-            forward_batch.cache_loc,
+            cache_loc,
             forward_batch.extend_prefix_lens,
             forward_batch.extend_seq_lens,
             layer.q_head_num,
@@ -170,6 +180,33 @@ class NativeAttention(AttentionBackend):
     def get_max_running_reqests(max_context_len: int, page_size: int) -> int:
         # native attention backend do not care the max running requests
         return 4096
+
+
+def compact_page_aligned_cache_loc(
+    cache_loc: jax.Array,
+    seq_lengths: jax.Array,
+    page_size: int,
+    mesh: Mesh,
+) -> jax.Array:
+    if page_size == 1:
+        return cache_loc
+
+    metadata_sharding = NamedSharding(mesh, P())
+    cache_loc = jax.sharding.reshard(cache_loc, metadata_sharding)
+    seq_lengths = jax.sharding.reshard(seq_lengths, metadata_sharding)
+    packed_starts = jnp.cumsum(seq_lengths, dtype=jnp.int32) - seq_lengths
+    aligned_lengths = ((seq_lengths + page_size - 1) // page_size) * page_size
+    aligned_starts = jnp.cumsum(aligned_lengths, dtype=jnp.int32) - aligned_lengths
+
+    positions = jnp.arange(cache_loc.shape[0], dtype=jnp.int32)
+    markers = jnp.zeros(cache_loc.shape[0], dtype=jnp.int32).at[packed_starts].set(1)
+    batch_ids = jnp.cumsum(markers, dtype=jnp.int32) - 1
+    batch_ids = jnp.clip(batch_ids, 0, seq_lengths.shape[0] - 1)
+    source_positions = aligned_starts[batch_ids] + positions - packed_starts[batch_ids]
+    valid = positions < jnp.sum(seq_lengths)
+    safe_source_positions = jnp.where(valid, source_positions, 0)
+    compacted = cache_loc.at[safe_source_positions].get(out_sharding=metadata_sharding)
+    return jnp.where(valid, compacted, 0)
 
 
 # @partial(jax.jit, static_argnames=["num_heads", "num_kv_heads", "is_causal", "mode"])
@@ -262,12 +299,15 @@ def forward_attention(
         scale = 1.0 / jnp.sqrt(head_dim)
     # (Q, H, K) layout: avoids broadcasting K-axis sharding into the Q-axis position
     # under Explicit-axis mesh + DP-sharded q_heads.
-    attn_logits = jnp.einsum(
-        "qhd,khd->qhk",
-        q_heads,
-        k_heads,
-        preferred_element_type=jnp.float32,
-    ) * scale
+    attn_logits = (
+        jnp.einsum(
+            "qhd,khd->qhk",
+            q_heads,
+            k_heads,
+            preferred_element_type=jnp.float32,
+        )
+        * scale
+    )
     if (relative_states is None) != (relative_projection is None):
         raise ValueError(
             "INKLING_RELATIVE_BIAS_INCOMPLETE relative_states and relative_projection "
@@ -374,49 +414,46 @@ def relative_position_bias(
 ) -> jax.Array:
     metadata_sharding = NamedSharding(mesh, P())
     seq_lengths = jax.sharding.reshard(seq_lengths, metadata_sharding)
-    extend_prefix_lens = jax.sharding.reshard(
-        extend_prefix_lens, metadata_sharding
-    )
+    extend_prefix_lens = jax.sharding.reshard(extend_prefix_lens, metadata_sharding)
     extend_seq_lens = jax.sharding.reshard(extend_seq_lens, metadata_sharding)
     query_len = relative_states.shape[0]
     key_starts = jnp.cumsum(seq_lengths, dtype=jnp.int32) - seq_lengths
-    key_markers = jnp.zeros(
-        (key_len,), dtype=jnp.int32, out_sharding=metadata_sharding
-    ).at[key_starts].set(1)
+    key_markers = (
+        jnp.zeros((key_len,), dtype=jnp.int32, out_sharding=metadata_sharding).at[key_starts].set(1)
+    )
     key_batch_ids = jnp.cumsum(key_markers, dtype=jnp.int32) - 1
-    key_positions = jnp.arange(
-        key_len, dtype=jnp.int32, out_sharding=metadata_sharding
-    ) - key_starts[key_batch_ids]
+    key_positions = (
+        jnp.arange(key_len, dtype=jnp.int32, out_sharding=metadata_sharding)
+        - key_starts[key_batch_ids]
+    )
 
     if mode == ForwardMode.EXTEND:
         query_starts = jnp.cumsum(extend_seq_lens, dtype=jnp.int32) - extend_seq_lens
-        query_markers = jnp.zeros(
-            (query_len,), dtype=jnp.int32, out_sharding=metadata_sharding
-        ).at[query_starts].set(1)
+        query_markers = (
+            jnp.zeros((query_len,), dtype=jnp.int32, out_sharding=metadata_sharding)
+            .at[query_starts]
+            .set(1)
+        )
         query_batch_ids = jnp.cumsum(query_markers, dtype=jnp.int32) - 1
         query_positions = (
-            jnp.arange(
-                query_len, dtype=jnp.int32, out_sharding=metadata_sharding
-            )
+            jnp.arange(query_len, dtype=jnp.int32, out_sharding=metadata_sharding)
             - query_starts[query_batch_ids]
             + extend_prefix_lens[query_batch_ids]
         )
     else:
-        query_batch_ids = jnp.arange(
-            query_len, dtype=jnp.int32, out_sharding=metadata_sharding
-        )
+        query_batch_ids = jnp.arange(query_len, dtype=jnp.int32, out_sharding=metadata_sharding)
         query_positions = seq_lengths[:query_len] - 1
 
-    projected = jnp.einsum(
-        "qhd,de->qhe",
-        relative_states,
-        projection,
-        preferred_element_type=jnp.float32,
-    )
     distance = query_positions[:, None] - key_positions[None, :]
     extent = projection.shape[-1]
-    gather_indices = jnp.clip(distance, 0, extent - 1)[:, None, :]
-    bias = jnp.take_along_axis(projected, gather_indices, axis=-1)
+    gather_indices = jnp.clip(distance, 0, extent - 1)
+    selected_projection = jnp.take(projection, gather_indices, axis=1).transpose(1, 2, 0)
+    bias = jnp.einsum(
+        "qhd,qkd->qhk",
+        relative_states,
+        selected_projection,
+        preferred_element_type=jnp.float32,
+    )
     same_sequence = query_batch_ids[:, None] == key_batch_ids[None, :]
     valid = same_sequence & (distance >= 0) & (distance < extent)
     return jnp.where(valid[:, None, :], bias, 0.0)

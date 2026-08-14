@@ -555,7 +555,12 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         if backend == "native":
             from sgl_jax.srt.layers.attention.native_backend import NativeAttention
 
-            full_attn_backend = NativeAttention(self.num_attn_heads, self.num_kv_heads, self.mesh)
+            full_attn_backend = NativeAttention(
+                self.num_attn_heads,
+                self.num_kv_heads,
+                self.page_size,
+                self.mesh,
+            )
 
         elif backend == "fa" and self.use_mla_backend:
             from sgl_jax.srt.layers.attention.mla_backend import MLAAttentionBackend

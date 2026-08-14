@@ -14,6 +14,7 @@ from safetensors.numpy import save_file
 
 from sgl_jax.srt.configs.inkling import InklingConfig, InklingTextConfig
 from sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.layers.attention.native_backend import compact_page_aligned_cache_loc
 from sgl_jax.srt.layers.attention.native_backend import relative_position_bias
 from sgl_jax.srt.layers.attention.native_backend import NativeAttention
 from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool
@@ -72,6 +73,24 @@ def make_config(
 
 
 class TestInklingLayout(unittest.TestCase):
+    def test_native_attention_compacts_page_aligned_request_locations(self):
+        cache_loc = np.zeros(256, dtype=np.int32)
+        cache_loc[:5] = np.arange(11, 16)
+        cache_loc[128:133] = np.arange(21, 26)
+
+        actual = compact_page_aligned_cache_loc(
+            jnp.asarray(cache_loc),
+            jnp.asarray([5, 5] + [0] * 10, dtype=jnp.int32),
+            128,
+            MESH,
+        )
+
+        np.testing.assert_array_equal(
+            np.asarray(actual[:10]),
+            np.asarray([11, 12, 13, 14, 15, 21, 22, 23, 24, 25]),
+        )
+        np.testing.assert_array_equal(np.asarray(actual[10:]), 0)
+
     def test_nvfp4_decode_uses_low_nibble_first_and_per_expert_scale(self):
         packed = np.zeros((2, 1, 8), dtype=np.uint8)
         packed[0, 0, 0] = 0x21
@@ -114,9 +133,7 @@ class TestInklingLayout(unittest.TestCase):
         relative_sharding = jax.sharding.NamedSharding(
             MESH, jax.sharding.PartitionSpec("data", None, None)
         )
-        lengths_sharding = jax.sharding.NamedSharding(
-            MESH, jax.sharding.PartitionSpec("data")
-        )
+        lengths_sharding = jax.sharding.NamedSharding(MESH, jax.sharding.PartitionSpec("data"))
         output_sharding = jax.sharding.NamedSharding(
             MESH, jax.sharding.PartitionSpec("data", None, None)
         )
@@ -217,9 +234,7 @@ class TestInklingModel(unittest.TestCase):
         np.testing.assert_array_equal(replicated[2], original[1])
 
         local = jnp.arange(16 * 128, dtype=jnp.float32).reshape(1, 16 * 128)
-        unchanged = loader._apply_kv_head_padding(
-            local, "model.llm.layers.4.attn.wk_dv.weight"
-        )
+        unchanged = loader._apply_kv_head_padding(local, "model.llm.layers.4.attn.wk_dv.weight")
         np.testing.assert_array_equal(np.asarray(unchanged), np.asarray(local))
 
     def test_dense_w13_is_interleaved_gate_then_up(self):
@@ -233,8 +248,7 @@ class TestInklingModel(unittest.TestCase):
         actual = np.asarray(mlp(hidden))
         gate_up = np.asarray(hidden) @ raw
         expected = (
-            jax.nn.silu(jnp.asarray(gate_up[:, 0::2]))
-            * jnp.asarray(gate_up[:, 1::2])
+            jax.nn.silu(jnp.asarray(gate_up[:, 0::2])) * jnp.asarray(gate_up[:, 1::2])
         ) @ jnp.asarray(down)
         np.testing.assert_allclose(actual, np.asarray(expected) * 0.75, rtol=1e-6, atol=1e-6)
 
@@ -255,7 +269,10 @@ class TestInklingModel(unittest.TestCase):
             axis=-1,
         )
         log_weights = jax.nn.log_sigmoid(selected)
-        expected = jnp.exp(log_weights - jax.scipy.special.logsumexp(log_weights, axis=-1, keepdims=True)) * 4
+        expected = (
+            jnp.exp(log_weights - jax.scipy.special.logsumexp(log_weights, axis=-1, keepdims=True))
+            * 4
+        )
         np.testing.assert_array_equal(np.asarray(ids), np.asarray(expected_ids))
         np.testing.assert_allclose(np.asarray(routed), np.asarray(expected[:, :2]), rtol=1e-6)
         np.testing.assert_allclose(np.asarray(shared), np.asarray(expected[:, 2:]), rtol=1e-6)
@@ -263,23 +280,18 @@ class TestInklingModel(unittest.TestCase):
     def test_router_preserves_bfloat16_reference_rounding(self):
         config = make_config().text_config
         moe = InklingMoE(config, make_config(), 2, MESH, jnp.bfloat16)
-        kernel = (
-            jnp.arange(32 * 10, dtype=jnp.float32).reshape(32, 10) / 200
-        ).astype(jnp.bfloat16)
+        kernel = (jnp.arange(32 * 10, dtype=jnp.float32).reshape(32, 10) / 200).astype(jnp.bfloat16)
         bias = jnp.linspace(-0.2, 0.2, 8, dtype=jnp.bfloat16)
         scale = jnp.asarray(0.00622559, dtype=jnp.bfloat16)
         moe.gate.kernel = nnx.Param(kernel)
         moe.correction_bias = nnx.Param(bias)
         moe.global_scale = nnx.Param(scale)
-        hidden = (jnp.arange(64, dtype=jnp.float32).reshape(2, 32) / 100).astype(
-            jnp.bfloat16
-        )
+        hidden = (jnp.arange(64, dtype=jnp.float32).reshape(2, 32) / 100).astype(jnp.bfloat16)
 
         ids, routed, shared = moe.routing_weights(hidden)
         logits = jnp.dot(hidden, kernel, precision=jax.lax.Precision.HIGHEST)
         choice_scores = (
-            jax.nn.sigmoid(logits[:, :8].astype(jnp.float32)).astype(jnp.bfloat16)
-            + bias
+            jax.nn.sigmoid(logits[:, :8].astype(jnp.float32)).astype(jnp.bfloat16) + bias
         )
         expected_ids = jax.lax.top_k(choice_scores.astype(jnp.float32), 2)[1]
         selected = jnp.concatenate(
@@ -288,10 +300,7 @@ class TestInklingModel(unittest.TestCase):
         )
         log_weights = jax.nn.log_sigmoid(selected.astype(jnp.float32)).astype(jnp.bfloat16)
         expected = (
-            jnp.exp(
-                log_weights
-                - jax.scipy.special.logsumexp(log_weights, axis=-1, keepdims=True)
-            )
+            jnp.exp(log_weights - jax.scipy.special.logsumexp(log_weights, axis=-1, keepdims=True))
             * config.route_scale
             * scale
         )
@@ -455,14 +464,12 @@ class TestInklingModel(unittest.TestCase):
             seq_lens=jnp.asarray([3], dtype=jnp.int32),
             out_cache_loc=jnp.asarray([1, 2, 3], dtype=jnp.int32),
             positions=jnp.asarray([0, 1, 2], dtype=jnp.int32),
-            attn_backend=NativeAttention(4, 2, MESH),
+            attn_backend=NativeAttention(4, 2, 1, MESH),
             cache_loc=jnp.asarray([1, 2, 3], dtype=jnp.int32),
             extend_prefix_lens=jnp.asarray([0], dtype=jnp.int32),
             extend_seq_lens=jnp.asarray([3], dtype=jnp.int32),
         )
-        hidden = (
-            jnp.arange(3 * 512, dtype=jnp.float32).reshape(3, 512).astype(jnp.bfloat16)
-        )
+        hidden = jnp.arange(3 * 512, dtype=jnp.float32).reshape(3, 512).astype(jnp.bfloat16)
         output, kv_fused, topk_ids, conv_updates = model.model.layers[0](
             batch.positions, hidden, batch, pool
         )
@@ -475,9 +482,7 @@ class TestInklingModel(unittest.TestCase):
     def test_dense_layer_prompt_then_decode_matches_one_shot(self):
         config = make_config(num_layers=1, hidden_size=512, head_dim=128)
         layer = InklingForCausalLM(config, MESH, dtype=jnp.bfloat16).model.layers[0]
-        hidden = (
-            jnp.arange(4 * 512, dtype=jnp.float32).reshape(4, 512) / 100
-        ).astype(jnp.bfloat16)
+        hidden = (jnp.arange(4 * 512, dtype=jnp.float32).reshape(4, 512) / 100).astype(jnp.bfloat16)
 
         def make_pool():
             return MHATokenToKVPool(
@@ -501,11 +506,9 @@ class TestInklingModel(unittest.TestCase):
                 seq_lens=jnp.asarray([seq_len], dtype=jnp.int32),
                 out_cache_loc=jnp.asarray(out_cache_loc, dtype=jnp.int32),
                 positions=jnp.asarray(positions, dtype=jnp.int32),
-                attn_backend=NativeAttention(4, 2, MESH),
+                attn_backend=NativeAttention(4, 2, 1, MESH),
                 cache_loc=jnp.asarray(cache_loc, dtype=jnp.int32),
-                extend_prefix_lens=jnp.asarray(
-                    [seq_len - token_count], dtype=jnp.int32
-                ),
+                extend_prefix_lens=jnp.asarray([seq_len - token_count], dtype=jnp.int32),
                 extend_seq_lens=jnp.asarray([token_count], dtype=jnp.int32),
                 recurrent_indices=jnp.asarray([1], dtype=jnp.int32),
             )
@@ -518,9 +521,7 @@ class TestInklingModel(unittest.TestCase):
                 jnp.zeros((2, 512, 3), dtype=jnp.float32),
             ]
 
-        one_shot_batch = make_batch(
-            ForwardMode.EXTEND, [0, 1, 2, 3], [1, 2, 3, 4], [1, 2, 3, 4], 4
-        )
+        one_shot_batch = make_batch(ForwardMode.EXTEND, [0, 1, 2, 3], [1, 2, 3, 4], [1, 2, 3, 4], 4)
         one_shot, _, _, _ = layer(
             one_shot_batch.positions,
             hidden,
@@ -530,9 +531,7 @@ class TestInklingModel(unittest.TestCase):
         )
 
         split_pool = make_pool()
-        prompt_batch = make_batch(
-            ForwardMode.EXTEND, [0, 1, 2], [1, 2, 3], [1, 2, 3], 3
-        )
+        prompt_batch = make_batch(ForwardMode.EXTEND, [0, 1, 2], [1, 2, 3], [1, 2, 3], 3)
         _, prompt_kv, _, states = layer(
             prompt_batch.positions,
             hidden[:3],
@@ -580,9 +579,7 @@ class TestInklingModel(unittest.TestCase):
         w13_scale = np.ones(
             (expert_count, 2 * intermediate_size, hidden_size // 16), dtype=np.float32
         )
-        w2_scale = np.ones(
-            (expert_count, hidden_size, intermediate_size // 16), dtype=np.float32
-        )
+        w2_scale = np.ones((expert_count, hidden_size, intermediate_size // 16), dtype=np.float32)
         w13_scale2 = np.linspace(0.5, 1.2, expert_count, dtype=np.float32)
         w2_scale2 = np.linspace(0.7, 1.4, expert_count, dtype=np.float32)
         prefix = "model.llm.layers.2.mlp.experts"
@@ -603,22 +600,14 @@ class TestInklingModel(unittest.TestCase):
 
         decoded_w13 = decode_nvfp4_numpy(packed_w13, w13_scale, w13_scale2)
         decoded_w2 = decode_nvfp4_numpy(packed_w2, w2_scale, w2_scale2)
-        expected_gate = np.transpose(decoded_w13[:, 0::2, :], (0, 2, 1)).astype(
-            np.float32
-        )
-        expected_up = np.transpose(decoded_w13[:, 1::2, :], (0, 2, 1)).astype(
-            np.float32
-        )
+        expected_gate = np.transpose(decoded_w13[:, 0::2, :], (0, 2, 1)).astype(np.float32)
+        expected_up = np.transpose(decoded_w13[:, 1::2, :], (0, 2, 1)).astype(np.float32)
         expected_down = np.transpose(decoded_w2, (0, 2, 1)).astype(np.float32)
         np.testing.assert_array_equal(
             np.asarray(experts.wi_0.value, dtype=np.float32), expected_gate
         )
-        np.testing.assert_array_equal(
-            np.asarray(experts.wi_1.value, dtype=np.float32), expected_up
-        )
-        np.testing.assert_array_equal(
-            np.asarray(experts.wo.value, dtype=np.float32), expected_down
-        )
+        np.testing.assert_array_equal(np.asarray(experts.wi_1.value, dtype=np.float32), expected_up)
+        np.testing.assert_array_equal(np.asarray(experts.wo.value, dtype=np.float32), expected_down)
 
         hidden = jnp.arange(2 * hidden_size, dtype=jnp.float32).reshape(2, hidden_size) / 50
         routes = jnp.asarray([[0, 1], [2, 3]], dtype=jnp.int32)
