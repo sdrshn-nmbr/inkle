@@ -5,6 +5,7 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.layers.radix_attention import AttentionType, RadixAttention
+from sgl_jax.srt.kernels.relative_position_bias import relative_position_bias_pallas
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -443,6 +444,17 @@ def relative_position_bias(
     else:
         query_batch_ids = jnp.arange(query_len, dtype=jnp.int32, out_sharding=metadata_sharding)
         query_positions = seq_lengths[:query_len] - 1
+
+    if is_tpu_runtime() and mode == ForwardMode.DECODE and query_len >= 8:
+        query_key_starts = key_starts[query_batch_ids]
+        bias = relative_position_bias_pallas(
+            relative_states,
+            projection,
+            query_positions,
+            query_key_starts,
+            key_len,
+        )
+        return jax.sharding.reshard(bias, NamedSharding(mesh, P("data", None, None)))
 
     distance = query_positions[:, None] - key_positions[None, :]
     extent = projection.shape[-1]
