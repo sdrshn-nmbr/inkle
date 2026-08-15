@@ -502,6 +502,8 @@ class FlashAttention(AttentionBackend):
         token_to_kv_pool: KVCache,
         causal: int = 1,
         attention_sink: jax.Array = None,
+        relative_states: jax.Array = None,
+        relative_projection: jax.Array = None,
     ):
         """
         Args:
@@ -526,6 +528,14 @@ class FlashAttention(AttentionBackend):
 
         if self.forward_metadata.custom_mask is not None:
             causal = 0
+        if (relative_states is None) != (relative_projection is None):
+            raise ValueError(
+                "relative_states and relative_projection must be provided together"
+            )
+        if relative_states is not None and forward_batch.forward_mode != ForwardMode.DECODE:
+            raise ValueError("Fused relative-position attention currently supports decode only")
+        if hasattr(relative_projection, "value"):
+            relative_projection = relative_projection.value
         # Select page indices and remap to SWA pool if KV cache supports it
         page_indices_arg = self.forward_metadata.page_indices
         is_swa_layer = layer.sliding_window_size is not None and layer.sliding_window_size > 0
@@ -554,6 +564,12 @@ class FlashAttention(AttentionBackend):
             (
                 P(self.kv_partition_axis) if attention_sink is not None else P()
             ),  # attention sink: (num_q_heads,), sharded by heads
+            (
+                P(self.attention_data_partition_axis, self.kv_partition_axis, None)
+                if relative_states is not None
+                else P()
+            ),  # relative states: query tokens x query heads x relative dim
+            P(),  # relative projection: replicated
         )
 
         out_specs = (
@@ -612,6 +628,8 @@ class FlashAttention(AttentionBackend):
             self.forward_metadata.distribution,
             self.forward_metadata.custom_mask,
             attention_sink,
+            relative_states,
+            relative_projection,
         )
 
         return (

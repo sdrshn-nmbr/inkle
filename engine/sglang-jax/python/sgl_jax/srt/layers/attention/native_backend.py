@@ -1,9 +1,14 @@
 import jax
 import jax.numpy as jnp
+from flax import nnx
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
+from sgl_jax.srt.layers.attention.flashattention_backend import (
+    FlashAttention,
+    FlashAttentionMetadata,
+)
 from sgl_jax.srt.layers.radix_attention import AttentionType, RadixAttention
 from sgl_jax.srt.kernels.relative_position_bias import relative_position_bias_pallas
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
@@ -31,9 +36,13 @@ class NativeAttention(AttentionBackend):
         self.page_size = page_size
         self.mesh = mesh
         self.kv_sharding = NamedSharding(self.mesh, P(None, "tensor", None))
+        self.kv_partition_axis = "tensor"
+        self.attention_data_partition_axis = "data"
+        self.head_dim = None
+        self.forward_metadata = nnx.data(FlashAttentionMetadata())
 
     def tree_flatten(self):
-        children = ()
+        children = (self.forward_metadata,)
         aux_data = {
             "num_heads": self.num_heads,
             "num_kv_heads": self.num_kv_heads,
@@ -44,16 +53,18 @@ class NativeAttention(AttentionBackend):
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
-        return cls(
+        obj = cls(
             num_attn_heads=aux_data["num_heads"],
             num_kv_heads=aux_data["num_kv_heads"],
             page_size=aux_data["page_size"],
             mesh=aux_data["mesh"],
         )
+        obj.forward_metadata = children[0]
+        return obj
 
     def get_forward_metadata(self, batch: ModelWorkerBatch):
         """Init the metadata for a forward pass and return it."""
-        return None
+        return FlashAttention.get_forward_metadata(self, batch)
 
     @named_scope
     def __call__(
@@ -74,6 +85,28 @@ class NativeAttention(AttentionBackend):
         Returns:
             Tuple of (output tensor of shape [total_tokens, hidden_size], kv_fused 5D)
         """
+        relative_states = kwargs.get("relative_states")
+        relative_projection = kwargs.get("relative_projection")
+        if hasattr(relative_projection, "value"):
+            relative_projection = relative_projection.value
+
+        if (
+            is_tpu_runtime()
+            and forward_batch.forward_mode == ForwardMode.DECODE
+            and relative_states is not None
+        ):
+            return FlashAttention.__call__(
+                self,
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                token_to_kv_pool,
+                relative_states=relative_states,
+                relative_projection=relative_projection,
+            )
+
         # TODO(pc) support tree based native attention backend
         k_buffer, v_buffer, kv_fused = self._get_and_update_kv_cache(
             k, v, forward_batch, token_to_kv_pool, layer.layer_id
@@ -95,11 +128,6 @@ class NativeAttention(AttentionBackend):
         attention_sink = kwargs.get("attention_sink")
         if attention_sink is not None and hasattr(attention_sink, "value"):
             attention_sink = attention_sink.value
-
-        relative_states = kwargs.get("relative_states")
-        relative_projection = kwargs.get("relative_projection")
-        if hasattr(relative_projection, "value"):
-            relative_projection = relative_projection.value
 
         cache_loc = compact_page_aligned_cache_loc(
             forward_batch.cache_loc,
@@ -176,6 +204,14 @@ class NativeAttention(AttentionBackend):
         v_3d = fused_3d.at[:, 1::2, :].get(out_sharding=self.kv_sharding)
 
         return k_3d, v_3d, fused_5d
+
+    def _get_fused_kv_cache(
+        self,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
+        layer_id: int,
+    ) -> jax.Array:
+        return token_to_kv_pool.get_fused_kv_buffer(layer_id)
 
     @staticmethod
     def get_max_running_reqests(max_context_len: int, page_size: int) -> int:

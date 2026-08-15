@@ -110,6 +110,8 @@ def ref_ragged_paged_attention(
     xai_temperature_len: float | None = None,
     attention_sink: jax.Array | float | None = None,
     softmax_dtype: jnp.dtype | None = None,
+    relative_states: jax.Array | None = None,
+    relative_projection: jax.Array | None = None,
 ):
     """Reference implementation for ragged paged attention."""
     if not causal:
@@ -150,6 +152,27 @@ def ref_ragged_paged_attention(
         v = jnp.repeat(v, num_query_per_kv, axis=1)
         attn = jnp.einsum("qhd,khd->hqk", q, k, preferred_element_type=jnp.float32)
         attn *= sm_scale
+        if relative_states is not None:
+            relative = relative_states[q_start:q_end]
+            query_positions = jnp.arange(kv_len - q_len, kv_len, dtype=jnp.int32)
+            key_positions = jnp.arange(kv_len, dtype=jnp.int32)
+            distances = query_positions[:, None] - key_positions[None, :]
+            extent = relative_projection.shape[-1]
+            selected_projection = jnp.take(
+                relative_projection,
+                jnp.clip(distances, 0, extent - 1),
+                axis=1,
+            ).transpose(1, 2, 0)
+            relative_bias = jnp.einsum(
+                "qhd,qkd->qhk",
+                relative,
+                selected_projection,
+                preferred_element_type=jnp.float32,
+            )
+            relative_valid = (distances >= 0) & (distances < extent)
+            attn += jnp.where(relative_valid[:, None, :], relative_bias, 0.0).transpose(
+                1, 0, 2
+            )
         if causal:
             q_span = (kv_len - q_len) + jax.lax.broadcasted_iota(jnp.int32, attn.shape, 1)
             kv_span = jax.lax.broadcasted_iota(jnp.int32, attn.shape, 2)
@@ -345,6 +368,8 @@ def _ragged_paged_attention_kernel_loop(
     custom_mask_ref,  # [flatten_total_kv_len, head_dim] or None
     zero_mask_ref,  # [bkv_sz, head_dim] or None
     attention_sink_ref,  # [actual_num_kv_heads, num_q_heads_per_kv_head, 128] or None
+    relative_states_ref,  # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head, 128]
+    relative_projection_ref,  # [128, 2 * max_kv_len + relative_extent]
     # Output
     o_hbm_ref,  # same shape as q_hbm_ref
     updated_kv_cache_hbm_ref,  # same shape as kv_cache_hbm_ref
@@ -368,6 +393,7 @@ def _ragged_paged_attention_kernel_loop(
     v_scale: float | None = None,
     xai_temperature_len: float | None = None,
     softmax_dtype: jnp.dtype | None = None,
+    relative_extent: int | None = None,
     static_q_len: int | None = None,
     bq_sz,  # bq fetch size
     bkv_sz,  # bkv prefetch size
@@ -449,6 +475,7 @@ def _ragged_paged_attention_kernel_loop(
         effective_kv_len,
         xai_temperature_reg=None,
         custom_mask_data=None,
+        relative_state=None,
     ):
         assert len(q.shape) == 2
         assert q.shape[0] % num_q_heads_per_kv_head == 0
@@ -479,6 +506,44 @@ def _ragged_paged_attention_kernel_loop(
             s_scale *= q_scale
 
         s *= s_scale
+
+        if relative_state is not None:
+            projection_padding = (
+                relative_projection_ref.shape[1] - relative_extent
+            ) // 2
+            projection_start = (
+                projection_padding
+                + relative_extent
+                - 1
+                - processed_q_len
+                + processed_kv_len
+            )
+            aligned_projection_start = pl.multiple_of(
+                projection_start - jnp.mod(projection_start, 128),
+                128,
+            )
+            projection_offset = projection_start - aligned_projection_start
+            projection_window = relative_projection_ref[
+                :, pl.ds(aligned_projection_start, bkv_csz + 128)
+            ]
+            relative_bias_window = pl.dot(
+                relative_state.astype(jnp.float32),
+                projection_window,
+            )
+            relative_bias_window = pltpu.roll(
+                relative_bias_window,
+                bkv_csz + 128 - projection_offset,
+                axis=1,
+            )
+            relative_bias = relative_bias_window[:, :bkv_csz]
+            query_position = processed_q_len
+            position_count = jnp.minimum(query_position + 1, relative_extent)
+            output_start = jnp.maximum(query_position - relative_extent + 1, 0)
+            relative_positions = processed_kv_len + jnp.arange(bkv_csz)
+            relative_valid = (relative_positions >= output_start) & (
+                relative_positions < output_start + position_count
+            )
+            s += jnp.where(relative_valid[None, :], relative_bias, 0.0)
 
         # xai temperature scaling
         if xai_temperature_reg is not None:
@@ -1079,6 +1144,14 @@ def _ragged_paged_attention_kernel_loop(
                                     effective_kv_len=effective_kv_len,
                                     xai_temperature_reg=cur_xai_temp,
                                     custom_mask_data=cur_mask_data,
+                                    relative_state=(
+                                        relative_states_ref[
+                                            kv_head_idx,
+                                            q_start + bq_idx * actual_bq_sz + bq_start,
+                                        ].reshape(num_q_heads_per_kv_head, -1)
+                                        if relative_states_ref is not None
+                                        else None
+                                    ),
                                 )
                                 flash_attention_step2_pv(
                                     cur_p,
@@ -1242,6 +1315,52 @@ def prepare_inputs(
     return q, kv, attention_sink
 
 
+def prepare_relative_bias_inputs(
+    relative_states: jax.Array,
+    relative_projection: jax.Array,
+    *,
+    actual_num_kv_heads: int,
+    actual_num_q_heads_per_kv_head: int,
+    q_packing: int,
+    work_len: int,
+) -> tuple[jax.Array, jax.Array]:
+    max_num_tokens, actual_num_q_heads, relative_dim = relative_states.shape
+    expected_num_q_heads = actual_num_kv_heads * actual_num_q_heads_per_kv_head
+    if actual_num_q_heads != expected_num_q_heads:
+        raise ValueError(
+            f"Expected {actual_num_q_heads=} to equal {expected_num_q_heads=}"
+        )
+    if relative_projection.shape[0] != relative_dim:
+        raise ValueError(
+            "relative_states and relative_projection must have the same relative dimension"
+        )
+
+    num_q_heads_per_kv_head = align_to(actual_num_q_heads_per_kv_head, q_packing)
+    padded_relative_dim = align_to(relative_dim, 128)
+    relative_states = jnp.pad(
+        relative_states.reshape(
+            max_num_tokens,
+            actual_num_kv_heads,
+            actual_num_q_heads_per_kv_head,
+            relative_dim,
+        ),
+        (
+            (0, 0),
+            (0, 0),
+            (0, num_q_heads_per_kv_head - actual_num_q_heads_per_kv_head),
+            (0, padded_relative_dim - relative_dim),
+        ),
+    ).swapaxes(0, 1)
+    relative_projection = jnp.pad(
+        relative_projection[:, ::-1],
+        (
+            (0, padded_relative_dim - relative_dim),
+            (work_len, work_len),
+        ),
+    )
+    return relative_states, relative_projection
+
+
 def prepare_outputs(
     out,  # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     actual_num_q_heads_per_kv_head: int,
@@ -1339,6 +1458,8 @@ def static_validate_inputs(
     vmem_limit_bytes: int | None = None,
     skip_kv_mask: bool = False,
     attention_sink=None,
+    relative_states=None,
+    relative_projection=None,
 ):
     """Validate inputs to the RPA kernel statically."""
     q, k, v = queries, keys, values
@@ -1358,6 +1479,22 @@ def static_validate_inputs(
         raise ValueError(
             f"Expected {actual_num_q_heads=} to be divisible by" f" {actual_num_kv_heads=}."
         )
+
+    if (relative_states is None) != (relative_projection is None):
+        raise ValueError(
+            "relative_states and relative_projection must be provided together"
+        )
+    if relative_states is not None:
+        if relative_states.shape[:2] != q.shape[:2]:
+            raise ValueError(
+                f"Expected {relative_states.shape[:2]=} to equal {q.shape[:2]=}"
+            )
+        if relative_projection.ndim != 2:
+            raise ValueError("relative_projection must be a matrix")
+        if relative_states.shape[2] != relative_projection.shape[0]:
+            raise ValueError(
+                "relative_states and relative_projection must have the same relative dimension"
+            )
 
     if kv_cache_fused is not None:
         kv_cache_processed = prepare_kv_cache_fused(kv_cache_fused)
@@ -1674,6 +1811,8 @@ def ragged_paged_attention(
     distribution: jax.Array,  # i32[3]
     custom_mask: jax.Array | None,
     attention_sink: jax.Array | None = None,
+    relative_states: jax.Array | None = None,
+    relative_projection: jax.Array | None = None,
     *,
     causal: int = 1,
     sm_scale: float = 1.0,
@@ -1760,12 +1899,18 @@ def ragged_paged_attention(
         vmem_limit_bytes=vmem_limit_bytes,
         skip_kv_mask=skip_kv_mask,
         attention_sink=attention_sink,
+        relative_states=relative_states,
+        relative_projection=relative_projection,
     )
 
     actual_num_q_heads = q.shape[1]
     actual_head_dim = q.shape[2]
     actual_num_kv_heads = k.shape[1]
     actual_num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
+
+    relative_extent = (
+        relative_projection.shape[1] if relative_projection is not None else None
+    )
 
     q, kv, attention_sink = prepare_inputs(q, k, v, attention_sink)
     kv_cache_fused_processed = prepare_kv_cache_fused(kv_cache_fused)
@@ -1783,6 +1928,15 @@ def ragged_paged_attention(
     num_page_indices = page_indices.shape[0]
     pages_per_seq = num_page_indices // max_num_seqs
     num_q_heads_per_kv_head = num_q_heads_per_kv_head_per_q_packing * q_packing
+    if relative_states is not None:
+        relative_states, relative_projection = prepare_relative_bias_inputs(
+            relative_states,
+            relative_projection,
+            actual_num_kv_heads=actual_num_kv_heads,
+            actual_num_q_heads_per_kv_head=actual_num_q_heads_per_kv_head,
+            q_packing=q_packing,
+            work_len=pages_per_seq * page_size,
+        )
     if out_dtype is None:
         out_dtype = jnp.float32 if q.dtype == jnp.float32 else jnp.bfloat16
 
@@ -1824,6 +1978,8 @@ def ragged_paged_attention(
         static_q_len=None,
         case: RpaCase = RpaCase.MIXED,
     ):
+        relative_states_arg = relative_states if case == RpaCase.DECODE else None
+        relative_projection_arg = relative_projection if case == RpaCase.DECODE else None
         in_specs = [
             pl.BlockSpec(memory_space=pltpu.HBM),  # q
             pl.BlockSpec(memory_space=pltpu.HBM),  # kv
@@ -1835,6 +1991,16 @@ def ragged_paged_attention(
             (
                 pl.BlockSpec(memory_space=pltpu.VMEM) if attention_sink is not None else None
             ),  # attention_sink
+            (
+                pl.BlockSpec(memory_space=pltpu.VMEM)
+                if relative_states_arg is not None
+                else None
+            ),  # relative_states
+            (
+                pl.BlockSpec(memory_space=pltpu.VMEM)
+                if relative_projection_arg is not None
+                else None
+            ),  # relative_projection
         ]
 
         out_specs = [
@@ -1933,6 +2099,7 @@ def ragged_paged_attention(
                 v_scale=v_scale,
                 xai_temperature_len=xai_temperature_len,
                 softmax_dtype=softmax_dtype,
+                relative_extent=(relative_extent if case == RpaCase.DECODE else None),
                 static_q_len=static_q_len,
                 bq_sz=bq_sz,
                 bkv_sz=bkv_sz,
@@ -1993,6 +2160,8 @@ def ragged_paged_attention(
                     ),
                     zero_mask,
                     attention_sink,
+                    relative_states_arg,
+                    relative_projection_arg,
                 )
 
         else:
@@ -2006,6 +2175,8 @@ def ragged_paged_attention(
                     custom_mask,
                     zero_mask,
                     attention_sink,
+                    relative_states_arg,
+                    relative_projection_arg,
                 )
 
         return run(scalar_prefetches, q, kv, kv_cache)
