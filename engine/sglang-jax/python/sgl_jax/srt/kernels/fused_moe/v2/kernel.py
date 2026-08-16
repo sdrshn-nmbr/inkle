@@ -156,6 +156,7 @@ def ref_moe(
     w1_shared_scale=None,
     w2_shared_scale=None,
     w3_shared_scale=None,
+    shared_weights=None,
     quant_block_k=None,
     w1_scale=None,
     w2_scale=None,
@@ -205,6 +206,17 @@ def ref_moe(
         gate_se = tokens_f32 @ _deq_se(w1_shared, w1_shared_scale)
         up_se = tokens_f32 @ _deq_se(w3_shared, w3_shared_scale)
         act_se = activation_fn(gate_se, up_se, act_fn, shared_swiglu_limit)
+        if shared_weights is not None:
+            num_shared_experts = shared_weights.shape[1]
+            if act_se.shape[1] % num_shared_experts != 0:
+                raise ValueError(
+                    f"Shared intermediate size {act_se.shape[1]} is not divisible by "
+                    f"num_shared_experts={num_shared_experts}."
+                )
+            shared_intermediate_size = act_se.shape[1] // num_shared_experts
+            act_se = act_se.reshape(num_tokens, num_shared_experts, shared_intermediate_size)
+            act_se = act_se * shared_weights.astype(jnp.float32)[..., None]
+            act_se = act_se.reshape(num_tokens, -1)
         out_se = act_se @ _deq_se(w2_shared, w2_shared_scale)
         output = output + out_se
 
@@ -348,6 +360,8 @@ def _fused_ep_moe_kernel(
     bse: int,
     quant_block_k: int | None = None,
     enable_act_quant: bool = False,
+    num_weighted_shared_experts: int = 0,
+    shared_expert_intermediate_size: int = 0,
 ):
     # ===== Dimension extraction =====
     dp_rank = lax.axis_index(dp_axis_name)
@@ -440,6 +454,11 @@ def _fused_ep_moe_kernel(
     if w1_shared_hbm is not None:
         se_inter_size = w2_shared_hbm.shape[0]
         se_total_blocks = cdiv(se_inter_size, bse)
+        if num_weighted_shared_experts:
+            assert shared_expert_intermediate_size > 0
+            assert se_inter_size == (
+                num_weighted_shared_experts * shared_expert_intermediate_size
+            )
 
     # ===== Mesh device ID — returns tuple for DeviceIdType.MESH =====
     def get_mesh_device_id(ep_rank):
@@ -1897,6 +1916,23 @@ def _fused_ep_moe_kernel(
             # Mode 2/3: the dot already yields the correctly-scaled f32 result.
 
             act = activation_fn(gate_acc, up_acc, act_fn, shared_swiglu_limit)  # (bt, bse) f32
+            if num_weighted_shared_experts:
+                blocks_per_shared_expert = shared_expert_intermediate_size // bse
+                shared_scale = jnp.zeros((bt,), dtype=jnp.float32)
+                for shared_expert_id in range(num_weighted_shared_experts):
+                    first_block = shared_expert_id * blocks_per_shared_expert
+                    after_last_block = first_block + blocks_per_shared_expert
+                    owns_block = jnp.logical_and(
+                        block_id >= first_block,
+                        block_id < after_last_block,
+                    )
+                    token_weights = b_topk_weights_x2_vmem[
+                        bt_sem_id,
+                        pl.ds(0, bt),
+                        top_k + shared_expert_id,
+                    ]
+                    shared_scale += jnp.where(owns_block, token_weights, 0.0)
+                act = act * shared_scale[:, None]
 
             # ----- FFN2 (down), accumulate into b_output -----
             if se_tok_fp8 and se_w_quant:
@@ -2319,6 +2355,7 @@ def fused_ep_moe_v2(
     w1_shared_scale: jax.Array | None = None,
     w2_shared_scale: jax.Array | None = None,
     w3_shared_scale: jax.Array | None = None,
+    shared_weights: jax.Array | None = None,
     quant_block_k: int | None = None,
     w1_scale: jax.Array | None = None,
     w2_scale: jax.Array | None = None,
@@ -2360,6 +2397,21 @@ def fused_ep_moe_v2(
         _se_scales = (w1_shared_scale, w2_shared_scale, w3_shared_scale)
         if any(s is not None for s in _se_scales) and any(s is None for s in _se_scales):
             raise ValueError("in-kernel shared expert w*_shared_scale must be all-set or all-None.")
+    if shared_weights is not None:
+        if w1_shared is None:
+            raise ValueError("shared_weights requires in-kernel shared expert weights.")
+        if shared_weights.ndim != 2 or shared_weights.shape[0] != tokens.shape[0]:
+            raise ValueError(
+                f"Expected shared_weights shape ({tokens.shape[0]}, S), got "
+                f"{shared_weights.shape}."
+            )
+        if w2_shared.shape[0] % shared_weights.shape[1] != 0:
+            raise ValueError(
+                f"Shared weight width {w2_shared.shape[0]} is not divisible by "
+                f"num_shared_experts={shared_weights.shape[1]}."
+            )
+        shared_weights = shared_weights.astype(jnp.float32)
+        topk_weights = jnp.concatenate((topk_weights, shared_weights), axis=1)
 
     ep_size = get_ep_size(mesh, dp_axis_name, tp_axis_name)
     num_devices = ep_size
@@ -2404,6 +2456,13 @@ def fused_ep_moe_v2(
             raise ValueError(f"in-kernel shared expert requires bse <= bf, got {bse=} {bf=}.")
         if bt > bts:
             raise ValueError(f"in-kernel shared expert requires bt <= bts, got {bt=} {bts=}.")
+        if shared_weights is not None:
+            shared_intermediate_size = w2_shared.shape[0] // shared_weights.shape[1]
+            if shared_intermediate_size % bse != 0:
+                raise ValueError(
+                    f"Weighted shared expert intermediate size {shared_intermediate_size} "
+                    f"must be divisible by {bse=} for in-kernel weighting."
+                )
 
     validate_fused_moe_block_config(
         num_tokens=num_tokens,
@@ -2452,7 +2511,10 @@ def fused_ep_moe_v2(
     padded_num_experts = align_to(num_experts, 128)
     pad_topk_to_128 = _env_bool("FUSED_MOE_V2_PAD_TOPK_TO_128", True)
     route_smem_topk_only = _env_bool("FUSED_MOE_V2_ROUTE_SMEM_TOPK_ONLY", False)
-    padded_top_k = align_to(top_k, 128) if pad_topk_to_128 else top_k
+    routing_weight_count = topk_weights.shape[1]
+    padded_top_k = (
+        align_to(routing_weight_count, 128) if pad_topk_to_128 else routing_weight_count
+    )
     routing_smem_top_k = top_k if route_smem_topk_only else padded_top_k
     t_dtype = tokens.dtype
     t_packing = get_dtype_packing(t_dtype)
@@ -2491,16 +2553,17 @@ def fused_ep_moe_v2(
 
     tokens = tokens.reshape(-1, in_packing, h_per_in)
 
-    if padded_top_k > top_k:
+    if padded_top_k > topk_ids.shape[1]:
         topk_ids = jnp.pad(
             topk_ids,
-            ((0, 0), (0, padded_top_k - top_k)),
+            ((0, 0), (0, padded_top_k - topk_ids.shape[1])),
             mode="constant",
             constant_values=-1,
         )
+    if padded_top_k > topk_weights.shape[1]:
         topk_weights = jnp.pad(
             topk_weights,
-            ((0, 0), (0, padded_top_k - top_k)),
+            ((0, 0), (0, padded_top_k - topk_weights.shape[1])),
             mode="constant",
             constant_values=0,
         )
@@ -2652,6 +2715,14 @@ def fused_ep_moe_v2(
                 bts=bts,
                 bse=bse,
                 quant_block_k=quant_block_k,
+                num_weighted_shared_experts=(
+                    0 if shared_weights is None else shared_weights.shape[1]
+                ),
+                shared_expert_intermediate_size=(
+                    0
+                    if shared_weights is None
+                    else w2_shared.shape[0] // shared_weights.shape[1]
+                ),
             ),
             out_shape=jax.ShapeDtypeStruct((local_num_tokens, hidden_size), out_dtype),
             grid_spec=pltpu.PrefetchScalarGridSpec(
