@@ -3,7 +3,6 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest import mock
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
@@ -11,8 +10,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
-from jax.sharding import NamedSharding
-from jax.sharding import PartitionSpec as P
 from safetensors.numpy import save_file
 
 from sgl_jax.srt.configs.inkling import InklingConfig, InklingTextConfig
@@ -315,39 +312,6 @@ class TestInklingModel(unittest.TestCase):
         np.testing.assert_array_equal(np.asarray(routed), np.asarray(expected[:, :2]))
         np.testing.assert_array_equal(np.asarray(shared), np.asarray(expected[:, 2:]))
 
-    def test_fused_v2_routes_existing_expert_weights_on_tpu(self):
-        root_config = make_config()
-        root_config.moe_backend = "fused_v2"
-        moe = InklingMoE(root_config.text_config, root_config, 2, MESH, jnp.float32)
-        hidden = jnp.arange(64, dtype=jnp.float32).reshape(2, 32) / 100
-        expected = jnp.full_like(hidden, 3.0)
-
-        with (
-            mock.patch("sgl_jax.srt.models.inkling.is_tpu_runtime", return_value=True),
-            mock.patch(
-                "sgl_jax.srt.models.inkling.fused_ep_moe_v2", return_value=expected
-            ) as fused,
-        ):
-            actual, _ = moe(hidden, NamedSharding(MESH, P("data", None)))
-
-        np.testing.assert_allclose(np.asarray(actual), np.asarray(expected))
-        self.assertEqual(fused.call_args.args[1].shape, hidden.shape)
-        self.assertEqual(fused.call_args.args[5].dtype, jnp.float32)
-        self.assertEqual(fused.call_args.kwargs["w1_shared"].shape, (32, 16))
-        self.assertEqual(fused.call_args.kwargs["w2_shared"].shape, (16, 32))
-        self.assertEqual(fused.call_args.kwargs["w3_shared"].shape, (32, 16))
-        self.assertEqual(fused.call_args.kwargs["shared_weights"].shape, (2, 2))
-        self.assertEqual(fused.call_args.kwargs["shared_weights"].dtype, jnp.float32)
-        np.testing.assert_array_equal(
-            np.asarray(fused.call_args.args[2]), np.asarray(moe.experts.wi_0.value)
-        )
-        np.testing.assert_array_equal(
-            np.asarray(fused.call_args.args[3]), np.asarray(moe.experts.wo.value)
-        )
-        np.testing.assert_array_equal(
-            np.asarray(fused.call_args.args[4]), np.asarray(moe.experts.wi_1.value)
-        )
-
     def test_checkpoint_mapping_covers_dense_and_sparse_layouts(self):
         model = InklingForCausalLM(make_config(), MESH, dtype=jnp.bfloat16)
         mappings = model._create_weight_mappings()
@@ -358,24 +322,6 @@ class TestInklingModel(unittest.TestCase):
         self.assertEqual(
             mappings["model.llm.layers.0.mlp.w13_dn.weight"].target_path,
             "model.layers.0.mlp.w13.weight",
-        )
-
-        fused_config = make_config()
-        fused_config.moe_backend = "fused_v2"
-        fused_mappings = InklingForCausalLM(
-            fused_config, MESH, dtype=jnp.bfloat16
-        )._create_weight_mappings()
-        self.assertEqual(
-            fused_mappings[
-                "model.llm.layers.2.mlp.shared_experts.shared_w13_weight"
-            ].sharding,
-            (None, None, None),
-        )
-        self.assertEqual(
-            fused_mappings[
-                "model.llm.layers.2.mlp.shared_experts.shared_w2_weight"
-            ].sharding,
-            (None, None, None),
         )
 
     def test_short_convolution_weights_remain_float32(self):

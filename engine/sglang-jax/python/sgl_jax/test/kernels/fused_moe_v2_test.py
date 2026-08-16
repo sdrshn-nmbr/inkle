@@ -140,7 +140,6 @@ class MoEV2KernelTest(jtu.JaxTestCase):
         quant_block_k=None,
         direct_scaled_dot=False,
         has_shared_expert=False,
-        num_weighted_shared_experts=0,
         se_intermediate_size=None,
         use_grouped_topk=False,
         num_groups=1,
@@ -152,9 +151,6 @@ class MoEV2KernelTest(jtu.JaxTestCase):
         atol=2e-1,
         rtol=2e-1,
     ):
-        if num_weighted_shared_experts:
-            has_shared_expert = True
-            se_intermediate_size = intermediate_size * num_weighted_shared_experts
         a, w1, w2, w3, gating, w1_sh, w2_sh, w3_sh = gen_moe_inputs(
             dtype,
             top_k,
@@ -184,14 +180,6 @@ class MoEV2KernelTest(jtu.JaxTestCase):
             topk_group=top_k_groups,
         )
         topk_weights, topk_ids = topk_module(gating)
-        shared_weights = None
-        if num_weighted_shared_experts:
-            shared_logits = jax.random.normal(
-                jax.random.key(seed + 1),
-                (num_tokens, num_weighted_shared_experts),
-                dtype=jnp.float32,
-            )
-            shared_weights = jax.nn.softmax(shared_logits, axis=-1)
 
         block_config = FusedMoEBlockConfig(bt=bt, bf=bf, btc=btc, bse=bse)
 
@@ -218,7 +206,6 @@ class MoEV2KernelTest(jtu.JaxTestCase):
             w1_shared_scale=w1_sh_scale,
             w2_shared_scale=w2_sh_scale,
             w3_shared_scale=w3_sh_scale,
-            shared_weights=shared_weights,
             direct_scaled_dot=direct_scaled_dot,
             dp_axis_name="data",
             tp_axis_name="tensor",
@@ -244,7 +231,6 @@ class MoEV2KernelTest(jtu.JaxTestCase):
             w1_shared_scale=w1_sh_scale,
             w2_shared_scale=w2_sh_scale,
             w3_shared_scale=w3_sh_scale,
-            shared_weights=shared_weights,
         )
 
         # Gather sharded outputs to a fully-replicated host array for comparison.
@@ -272,9 +258,6 @@ class MoEV2KernelTest(jtu.JaxTestCase):
 
     def test_shared_expert(self):
         self._test_moe(has_shared_expert=True)
-
-    def test_two_weighted_shared_experts(self):
-        self._test_moe(num_weighted_shared_experts=2)
 
     def test_grouped_topk(self):
         self._test_moe(

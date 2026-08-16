@@ -11,7 +11,6 @@ from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
-from sgl_jax.srt.kernels.fused_moe.v2.kernel import fused_ep_moe_v2
 from sgl_jax.srt.layers.attention.linear.short_convolution import short_convolution
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead
 from sgl_jax.srt.layers.layernorm import RMSNorm
@@ -22,7 +21,6 @@ from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.models.inkling_layout import decode_nvfp4_numpy
-from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 from sgl_jax.srt.utils.weight_utils import (
     SequentialSafetensorManager,
     WeightLoader,
@@ -41,19 +39,6 @@ def _slice_bounds(index: slice, size: int) -> tuple[int, int]:
     if step != 1:
         raise ValueError(f"INKLING_UNSUPPORTED_SHARD_STEP step={step}")
     return start, stop
-
-
-def gather_fused_moe_tokens(
-    hidden_states: jax.Array,
-    mesh: jax.sharding.Mesh,
-) -> jax.Array:
-    return jax.shard_map(
-        lambda x: jax.lax.all_gather(x, "tensor", axis=0, tiled=True),
-        mesh=mesh,
-        in_specs=P(("data", "tensor"), None),
-        out_specs=P("data", None),
-        check_vma=False,
-    )(hidden_states)
 
 
 def split_interleaved_gate_up(
@@ -306,7 +291,6 @@ class InklingMoE(nnx.Module):
         self.num_experts_per_tok = config.num_experts_per_tok
         self.route_scale = float(config.route_scale)
         self.mesh = mesh
-        self.use_fused_routed_experts = getattr(root_config, "moe_backend", "epmoe") == "fused_v2"
         self.gate = GateLogit(
             input_size=config.hidden_size,
             num_experts=self.num_routed_experts + self.num_shared_experts,
@@ -384,72 +368,12 @@ class InklingMoE(nnx.Module):
         out_sharding: NamedSharding,
     ) -> tuple[jax.Array, jax.Array]:
         topk_ids, routed_weights, shared_weights = self.routing_weights(hidden_states)
-        if self.use_fused_routed_experts and is_tpu_runtime():
-            token_count = hidden_states.shape[0]
-            padded_token_count = (
-                (token_count + self.mesh.size - 1) // self.mesh.size * self.mesh.size
-            )
-            token_padding = padded_token_count - token_count
-            hidden_states_for_fused = jnp.pad(
-                hidden_states,
-                ((0, token_padding), (0, 0)),
-            )
-            routed_weights_for_fused = jnp.pad(
-                routed_weights.astype(jnp.float32),
-                ((0, token_padding), (0, 0)),
-            )
-            shared_weights_for_fused = jnp.pad(
-                shared_weights.astype(jnp.float32),
-                ((0, token_padding), (0, 0)),
-            )
-            topk_ids_for_fused = jnp.pad(
-                topk_ids,
-                ((0, token_padding), (0, 0)),
-                constant_values=-1,
-            )
-            token_sharding = NamedSharding(self.mesh, P(("data", "tensor"), None))
-            expert_sharding = NamedSharding(self.mesh, P(("data", "tensor"), None, None))
-            replicated = NamedSharding(self.mesh, P())
-            shared_w13 = jax.sharding.reshard(self.shared_experts.w13.value, replicated)
-            shared_w2 = jax.sharding.reshard(self.shared_experts.w2.value, replicated)
-            shared_gate = shared_w13[..., 0::2].transpose(1, 0, 2).reshape(
-                self.experts.hidden_size,
-                -1,
-            )
-            shared_up = shared_w13[..., 1::2].transpose(1, 0, 2).reshape(
-                self.experts.hidden_size,
-                -1,
-            )
-            shared_down = shared_w2.reshape(-1, self.experts.hidden_size)
-            routed = fused_ep_moe_v2(
-                self.mesh,
-                jax.sharding.reshard(hidden_states_for_fused, token_sharding),
-                jax.sharding.reshard(self.experts.wi_0.value, expert_sharding),
-                jax.sharding.reshard(self.experts.wo.value, expert_sharding),
-                jax.sharding.reshard(self.experts.wi_1.value, expert_sharding),
-                jax.sharding.reshard(routed_weights_for_fused, token_sharding),
-                jax.sharding.reshard(topk_ids_for_fused, token_sharding),
-                self.num_experts_per_tok,
-                act_fn="silu",
-                w1_shared=shared_gate,
-                w2_shared=shared_down,
-                w3_shared=shared_up,
-                shared_weights=jax.sharding.reshard(
-                    shared_weights_for_fused, token_sharding
-                ),
-            )
-            routed = gather_fused_moe_tokens(routed, self.mesh)
-            routed = routed[:token_count]
-            routed = jax.sharding.reshard(routed, out_sharding)
-        else:
-            routed = self.experts(
-                hidden_states,
-                routed_weights,
-                topk_ids,
-                out_sharding=out_sharding,
-            )
-        if self.use_fused_routed_experts and is_tpu_runtime():
-            return routed, topk_ids
+        routed = self.experts(
+            hidden_states,
+            routed_weights,
+            topk_ids,
+            out_sharding=out_sharding,
+        )
         shared = self.shared_experts(hidden_states, shared_weights)
         return routed + shared, topk_ids
 
@@ -810,13 +734,6 @@ class InklingForCausalLM(nnx.Module):
         )
 
     def _create_weight_mappings(self) -> dict[str, WeightMapping]:
-        fused_shared_experts = getattr(self.config, "moe_backend", "epmoe") == "fused_v2"
-        shared_w13_sharding = (
-            (None, None, None) if fused_shared_experts else (None, None, "tensor")
-        )
-        shared_w2_sharding = (
-            (None, None, None) if fused_shared_experts else (None, "tensor", None)
-        )
         mappings = {
             "model.llm.embed.weight": WeightMapping(
                 "model.embed_tokens.embedding", sharding=("tensor", None)
@@ -900,7 +817,7 @@ class InklingForCausalLM(nnx.Module):
                 )
                 mappings[f"{source}.mlp.shared_experts.shared_w13_weight"] = WeightMapping(
                     f"{target}.mlp.shared_experts.w13",
-                    sharding=shared_w13_sharding,
+                    sharding=(None, None, "tensor"),
                     transpose_axes=(0, 2, 1),
                     reshape=(
                         self.text_config.n_shared_experts,
@@ -910,7 +827,7 @@ class InklingForCausalLM(nnx.Module):
                 )
                 mappings[f"{source}.mlp.shared_experts.shared_w2_weight"] = WeightMapping(
                     f"{target}.mlp.shared_experts.w2",
-                    sharding=shared_w2_sharding,
+                    sharding=(None, "tensor", None),
                     transpose_axes=(0, 2, 1),
                     reshape=(
                         self.text_config.n_shared_experts,
