@@ -17,11 +17,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trace-mode")
     parser.add_argument("--profile-chip-count", type=int)
     parser.add_argument("--perf-counters", action="store_true")
+    parser.add_argument(
+        "--periodic-counters",
+        action="store_true",
+        help="Use JAX 0.9+ periodic TPU counters with the required libtpu LLO trace flags",
+    )
     parser.add_argument("--enable-hlo-proto", action="store_true")
     return parser.parse_args()
 
 
 def profiler_options(args: argparse.Namespace) -> jax.profiler.ProfileOptions:
+    if args.perf_counters and args.periodic_counters:
+        raise ValueError("Choose either perf counters or periodic counters, not both")
     options = jax.profiler.ProfileOptions()
     options.raise_error_on_start_failure = True
     options.enable_hlo_proto = args.enable_hlo_proto
@@ -29,9 +36,25 @@ def profiler_options(args: argparse.Namespace) -> jax.profiler.ProfileOptions:
     if args.trace_mode:
         advanced_configuration["tpu_trace_mode"] = args.trace_mode
     if args.profile_chip_count is not None:
-        advanced_configuration["tpu_num_chips_to_profile_per_task"] = args.profile_chip_count
+        advanced_configuration["tpu_num_chips_to_profile_per_task"] = (
+            args.profile_chip_count
+        )
     if args.perf_counters:
         advanced_configuration["tpu_perf_counters"] = True
+    if args.periodic_counters:
+        advanced_configuration.update(
+            {
+                "tpu_enable_periodic_counter_sampling": True,
+                "tpu_tc_perf_counter_sampling_options": (
+                    "interval_us:1 scaling:0 counter_size_bits:1 "
+                    "indices:1 indices:3 indices:4 indices:10 indices:11 "
+                    "indices:31 indices:32 indices:33 indices:34 indices:35 "
+                    "indices:37 indices:38 indices:56 indices:57 indices:58 "
+                    "indices:73 indices:74 indices:75 indices:105"
+                ),
+                "num_tensor_cores_to_trace_per_device": 1,
+            }
+        )
     if advanced_configuration:
         options.advanced_configuration = advanced_configuration
     return options
@@ -40,7 +63,9 @@ def profiler_options(args: argparse.Namespace) -> jax.profiler.ProfileOptions:
 def main() -> None:
     args = parse_args()
     if jax.default_backend() != "tpu":
-        raise RuntimeError(f"TPU_PROFILE_PROBE_REQUIRES_TPU backend={jax.default_backend()}")
+        raise RuntimeError(
+            f"TPU_PROFILE_PROBE_REQUIRES_TPU backend={jax.default_backend()}"
+        )
 
     args.output_directory.mkdir(parents=True, exist_ok=True)
     trace_directory = args.output_directory / "profile"

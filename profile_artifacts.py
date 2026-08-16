@@ -4,6 +4,14 @@ from pathlib import Path
 
 from xprof.convert import raw_to_tool_data
 
+XPROF_EXPORT_TOOLS = (
+    "overview_page",
+    "framework_op_stats",
+    "op_profile",
+    "hlo_stats",
+    "roofline_model",
+)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -11,7 +19,49 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--require-device-events", action="store_true")
     parser.add_argument("--require-compiled-program", action="store_true")
+    parser.add_argument("--export-xprof-tools", type=Path)
     return parser.parse_args()
+
+
+def export_xprof_tools(
+    profile_directory: Path, output_directory: Path
+) -> dict[str, object]:
+    profile_files = sorted(profile_directory.rglob("*.xplane.pb"))
+    output_directory.mkdir(parents=True, exist_ok=True)
+    exports = []
+    for profile_file in profile_files:
+        profile_paths = [str(profile_file)]
+        available_tools = set(raw_to_tool_data.xspace_to_tool_names(profile_paths))
+        profile_output = (
+            output_directory
+            / profile_file.relative_to(profile_directory).parent
+            / profile_file.stem
+        )
+        profile_output.mkdir(parents=True, exist_ok=True)
+        for tool in XPROF_EXPORT_TOOLS:
+            if tool not in available_tools:
+                continue
+            data, mime_type = raw_to_tool_data.xspace_to_tool_data(
+                profile_paths, tool, {}
+            )
+            suffix = ".json" if mime_type == "application/json" else ".bin"
+            output_file = profile_output / f"{tool}{suffix}"
+            encoded = data if isinstance(data, bytes) else str(data).encode()
+            output_file.write_bytes(encoded)
+            exports.append(
+                {
+                    "profile": str(profile_file),
+                    "tool": tool,
+                    "mime_type": mime_type,
+                    "output": str(output_file),
+                    "size_bytes": len(encoded),
+                }
+            )
+    manifest = {"exports": exports}
+    (output_directory / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+    )
+    return manifest
 
 
 def inspect_profile(profile_directory: Path) -> dict[str, object]:
@@ -73,6 +123,10 @@ def inspect_profile(profile_directory: Path) -> dict[str, object]:
 def main() -> None:
     args = parse_args()
     result = inspect_profile(args.profile_directory)
+    if args.export_xprof_tools:
+        result["xprof_exports"] = export_xprof_tools(
+            args.profile_directory, args.export_xprof_tools
+        )
     output = json.dumps(result, indent=2, sort_keys=True)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
