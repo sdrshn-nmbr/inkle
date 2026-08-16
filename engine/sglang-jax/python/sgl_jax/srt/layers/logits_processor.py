@@ -268,8 +268,8 @@ class LogitsProcessor(nnx.Module):
         return jax.shard_map(
             select_local_fn,
             mesh=self.mesh,
-            in_specs=(P("data", None), P("data")),
-            out_specs=P("data", None),
+            in_specs=(P("data", "tensor"), P("data")),
+            out_specs=P("data", "tensor"),
         )(hidden_states, indices)
 
     def _select_logits(self, logits: jax.Array, indices: jax.Array) -> jax.Array:

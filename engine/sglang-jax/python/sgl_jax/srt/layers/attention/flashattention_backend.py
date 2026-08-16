@@ -608,6 +608,28 @@ class FlashAttention(AttentionBackend):
 
             return result, updated_kv_cache_fused
 
+        attention_input_sharding = NamedSharding(
+            self.mesh,
+            P(self.attention_data_partition_axis, self.kv_partition_axis, None),
+        )
+        queries = jax.sharding.reshard(
+            q.reshape(q.shape[0], -1, getattr(layer, "head_dim", self.head_dim)),
+            attention_input_sharding,
+        )
+        keys = jax.sharding.reshard(
+            k.reshape(k.shape[0], -1, getattr(layer, "head_dim", self.head_dim)),
+            attention_input_sharding,
+        )
+        values = jax.sharding.reshard(
+            v.reshape(v.shape[0], -1, getattr(layer, "head_dim", self.head_dim)),
+            attention_input_sharding,
+        )
+        if relative_states is not None:
+            relative_states = jax.sharding.reshard(
+                relative_states,
+                attention_input_sharding,
+            )
+
         (
             attn_output,
             updated_kv_cache_fused,
@@ -617,9 +639,9 @@ class FlashAttention(AttentionBackend):
             out_specs=out_specs,
             check_vma=False,
         )(
-            q.reshape(q.shape[0], -1, getattr(layer, "head_dim", self.head_dim)),
-            k.reshape(k.shape[0], -1, getattr(layer, "head_dim", self.head_dim)),
-            v.reshape(v.shape[0], -1, getattr(layer, "head_dim", self.head_dim)),
+            queries,
+            keys,
+            values,
             kv_cache_fused,
             self.forward_metadata.seq_lens,
             page_indices_arg,

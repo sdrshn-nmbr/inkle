@@ -430,15 +430,31 @@ class TestInklingModel(unittest.TestCase):
 
     def test_short_convolution_can_be_traced(self):
         convolution = InklingShortConvolution(4, 4, MESH)
-        batch = SimpleNamespace(
-            forward_mode=ForwardMode.EXTEND,
-            extend_seq_lens=jnp.asarray([4], dtype=jnp.int32),
-            recurrent_indices=None,
+        hidden_sharding = jax.sharding.NamedSharding(
+            MESH, jax.sharding.PartitionSpec("data", "tensor")
+        )
+        lengths_sharding = jax.sharding.NamedSharding(
+            MESH, jax.sharding.PartitionSpec("data")
         )
 
-        jax.make_jaxpr(lambda hidden: convolution.apply(hidden, batch, None)[0])(
-            jnp.ones((4, 4), dtype=jnp.bfloat16)
+        def apply_convolution(hidden, sequence_lengths):
+            batch = SimpleNamespace(
+                forward_mode=ForwardMode.EXTEND,
+                extend_seq_lens=sequence_lengths,
+                recurrent_indices=None,
+            )
+            return convolution.apply(hidden, batch, None)[0]
+
+        result = jax.jit(
+            apply_convolution,
+            in_shardings=(hidden_sharding, lengths_sharding),
+            out_shardings=hidden_sharding,
+        )(
+            jax.device_put(jnp.ones((4, 4), dtype=jnp.bfloat16), hidden_sharding),
+            jax.device_put(jnp.asarray([4], dtype=jnp.int32), lengths_sharding),
         )
+
+        self.assertEqual(result.shape, (4, 4))
 
     def test_dense_layer_prefill_runs_through_native_attention(self):
         model = InklingForCausalLM(

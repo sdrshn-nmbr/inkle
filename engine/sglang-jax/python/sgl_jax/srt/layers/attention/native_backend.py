@@ -231,13 +231,13 @@ def compact_page_aligned_cache_loc(
     metadata_sharding = NamedSharding(mesh, P())
     cache_loc = jax.sharding.reshard(cache_loc, metadata_sharding)
     seq_lengths = jax.sharding.reshard(seq_lengths, metadata_sharding)
-    packed_starts = jnp.cumsum(seq_lengths, dtype=jnp.int32) - seq_lengths
+    packed_starts = jnp.cumsum(seq_lengths, axis=0, dtype=jnp.int32) - seq_lengths
     aligned_lengths = ((seq_lengths + page_size - 1) // page_size) * page_size
-    aligned_starts = jnp.cumsum(aligned_lengths, dtype=jnp.int32) - aligned_lengths
+    aligned_starts = jnp.cumsum(aligned_lengths, axis=0, dtype=jnp.int32) - aligned_lengths
 
     positions = jnp.arange(cache_loc.shape[0], dtype=jnp.int32)
     markers = jnp.zeros(cache_loc.shape[0], dtype=jnp.int32).at[packed_starts].set(1)
-    batch_ids = jnp.cumsum(markers, dtype=jnp.int32) - 1
+    batch_ids = jnp.cumsum(markers, axis=0, dtype=jnp.int32) - 1
     batch_ids = jnp.clip(batch_ids, 0, seq_lengths.shape[0] - 1)
     source_positions = aligned_starts[batch_ids] + positions - packed_starts[batch_ids]
     valid = positions < jnp.sum(seq_lengths)
@@ -373,9 +373,9 @@ def forward_attention(
 
         # Determine the sequence position of each query token
         if mode == ForwardMode.EXTEND:
-            q_starts = jnp.cumsum(extend_seq_lens) - extend_seq_lens
+            q_starts = jnp.cumsum(extend_seq_lens, axis=0) - extend_seq_lens
             q_batch_indicators = jnp.zeros(query_len, dtype=jnp.int32).at[q_starts].set(1)
-            q_batch_ids = jnp.cumsum(q_batch_indicators) - 1
+            q_batch_ids = jnp.cumsum(q_batch_indicators, axis=0) - 1
             q_relative_pos = jnp.arange(query_len, dtype=jnp.int32) - q_starts[q_batch_ids]
             q_positions = extend_prefix_lens[q_batch_ids] + q_relative_pos
         else:  # mode == ForwardMode.DECODE
@@ -454,24 +454,26 @@ def relative_position_bias(
     extend_prefix_lens = jax.sharding.reshard(extend_prefix_lens, metadata_sharding)
     extend_seq_lens = jax.sharding.reshard(extend_seq_lens, metadata_sharding)
     query_len = relative_states.shape[0]
-    key_starts = jnp.cumsum(seq_lengths, dtype=jnp.int32) - seq_lengths
+    key_starts = jnp.cumsum(seq_lengths, axis=0, dtype=jnp.int32) - seq_lengths
     key_markers = (
         jnp.zeros((key_len,), dtype=jnp.int32, out_sharding=metadata_sharding).at[key_starts].set(1)
     )
-    key_batch_ids = jnp.cumsum(key_markers, dtype=jnp.int32) - 1
+    key_batch_ids = jnp.cumsum(key_markers, axis=0, dtype=jnp.int32) - 1
     key_positions = (
         jnp.arange(key_len, dtype=jnp.int32, out_sharding=metadata_sharding)
         - key_starts[key_batch_ids]
     )
 
     if mode == ForwardMode.EXTEND:
-        query_starts = jnp.cumsum(extend_seq_lens, dtype=jnp.int32) - extend_seq_lens
+        query_starts = (
+            jnp.cumsum(extend_seq_lens, axis=0, dtype=jnp.int32) - extend_seq_lens
+        )
         query_markers = (
             jnp.zeros((query_len,), dtype=jnp.int32, out_sharding=metadata_sharding)
             .at[query_starts]
             .set(1)
         )
-        query_batch_ids = jnp.cumsum(query_markers, dtype=jnp.int32) - 1
+        query_batch_ids = jnp.cumsum(query_markers, axis=0, dtype=jnp.int32) - 1
         query_positions = (
             jnp.arange(query_len, dtype=jnp.int32, out_sharding=metadata_sharding)
             - query_starts[query_batch_ids]
@@ -534,14 +536,14 @@ def _apply_extend_mask(
     k_valid_mask = jnp.arange(key_len) < jnp.sum(seq_lengths)
 
     # --- 1. Generate Batch IDs (Optimized) ---
-    q_starts = jnp.cumsum(extend_seq_lens, dtype=jnp.int32) - extend_seq_lens
+    q_starts = jnp.cumsum(extend_seq_lens, axis=0, dtype=jnp.int32) - extend_seq_lens
     q_batch_indicators = jnp.zeros(query_len, dtype=jnp.int32).at[q_starts].set(1)
-    q_batch_ids = jnp.cumsum(q_batch_indicators, dtype=jnp.int32) - 1
+    q_batch_ids = jnp.cumsum(q_batch_indicators, axis=0, dtype=jnp.int32) - 1
 
     full_seq_lens = seq_lengths
-    k_starts = jnp.cumsum(full_seq_lens, dtype=jnp.int32) - full_seq_lens
+    k_starts = jnp.cumsum(full_seq_lens, axis=0, dtype=jnp.int32) - full_seq_lens
     k_batch_indicators = jnp.zeros(key_len, dtype=jnp.int32).at[k_starts].set(1)
-    k_batch_ids = jnp.cumsum(k_batch_indicators, dtype=jnp.int32) - 1
+    k_batch_ids = jnp.cumsum(k_batch_indicators, axis=0, dtype=jnp.int32) - 1
 
     # --- 2. Create block-diagonal mask ---
     final_mask = q_batch_ids[:, None] == k_batch_ids[None, :]
@@ -592,7 +594,9 @@ def _apply_decode_mask(
 
     def create_decode_sequence_mask():
         total_prefix_len = key_len
-        seq_starts = jnp.cumsum(jnp.concatenate([jnp.array([0]), seq_lengths[:-1]]))
+        seq_starts = jnp.cumsum(
+            jnp.concatenate([jnp.array([0]), seq_lengths[:-1]]), axis=0
+        )
         seq_ends = seq_starts + seq_lengths
         all_positions = jnp.arange(total_prefix_len)
         seq_mask = (all_positions[None, :] >= seq_starts[:, None]) & (

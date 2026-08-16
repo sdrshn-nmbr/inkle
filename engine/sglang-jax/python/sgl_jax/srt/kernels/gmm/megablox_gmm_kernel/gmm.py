@@ -143,7 +143,7 @@ def make_group_metadata(
     # group_offsets[num_groups] = m
     #
     # The row at which group 'i' starts is group_offsets[i].
-    group_ends = jnp.cumsum(group_sizes)
+    group_ends = jnp.cumsum(group_sizes, axis=0)
     group_offsets = jnp.concatenate([jnp.zeros(1, dtype=jnp.int32), group_ends])
 
     # Assign a group id to each grid index.

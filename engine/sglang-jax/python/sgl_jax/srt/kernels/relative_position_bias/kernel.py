@@ -90,7 +90,7 @@ def _relative_position_bias_pallas_local(
             dimension_semantics=("parallel",),
             disable_bounds_checks=True,
         )
-    vmem = pltpu.ANY if interpret else pltpu.VMEM
+    vmem = None if interpret else pltpu.VMEM
     return pl.pallas_call(
         kernel,
         out_shape=jax.ShapeDtypeStruct(

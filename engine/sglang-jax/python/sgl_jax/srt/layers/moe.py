@@ -677,7 +677,10 @@ class EPMoE(nnx.Module):
         input_offsets = jnp.full(ep_size, start_idx, dtype=tokens_group.dtype)
         send_sizes = jnp.repeat(tokens_group[shard_id], ep_size)
         output_offset = jnp.concatenate(
-            (jnp.array([0], dtype=tokens_group.dtype), jnp.cumsum(tokens_group[:-1]))
+            (
+                jnp.array([0], dtype=tokens_group.dtype),
+                jnp.cumsum(tokens_group[:-1], axis=0),
+            )
         )[shard_id]
         output_offsets = jnp.repeat(output_offset, ep_size)
         recv_sizes = tokens_group

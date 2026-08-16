@@ -1,4 +1,5 @@
 import argparse
+import gzip
 import json
 from pathlib import Path
 
@@ -10,6 +11,8 @@ XPROF_EXPORT_TOOLS = (
     "op_profile",
     "hlo_stats",
     "roofline_model",
+    "perf_counters",
+    "utilization_viewer",
 )
 
 
@@ -19,6 +22,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--require-device-events", action="store_true")
     parser.add_argument("--require-compiled-program", action="store_true")
+    parser.add_argument("--require-hbm-counters", action="store_true")
+    parser.add_argument("--require-cycle-counters", action="store_true")
     parser.add_argument("--export-xprof-tools", type=Path)
     return parser.parse_args()
 
@@ -69,20 +74,53 @@ def inspect_profile(profile_directory: Path) -> dict[str, object]:
     files = []
     device_event_count = 0
     compiled_event_count = 0
-    compiled_terms = ("xla", "hlo", "fusion", "custom", "dot", "matmul", "module")
+    hbm_read_counter_event_count = 0
+    hbm_write_counter_event_count = 0
+    cycle_counter_event_count = 0
+    compiled_terms = (
+        "bundle.",
+        "xla",
+        "hlo",
+        "fusion",
+        "custom",
+        "dot",
+        "matmul",
+        "module",
+    )
 
     for profile_file in profile_files:
         profile_paths = [str(profile_file)]
         tool_names = raw_to_tool_data.xspace_to_tool_names(profile_paths)
-        trace_data, _ = raw_to_tool_data.xspace_to_tool_data(
-            profile_paths,
-            "trace_viewer",
-            {"use_saved_result": False},
+        saved_trace_file = profile_file.with_name(
+            profile_file.name.removesuffix(".xplane.pb") + ".trace.json.gz"
         )
-        trace = json.loads(trace_data)
+        if saved_trace_file.exists():
+            with gzip.open(saved_trace_file, "rt") as trace_input:
+                trace = json.load(trace_input)
+            trace_source = str(saved_trace_file)
+        else:
+            trace_data, _ = raw_to_tool_data.xspace_to_tool_data(
+                profile_paths,
+                "trace_viewer",
+                {"use_saved_result": False},
+            )
+            trace = json.loads(trace_data)
+            trace_source = "xplane_conversion"
+        trace_events = trace.get("traceEvents", [])
+        hbm_read_counter_event_count += sum(
+            "RD_RSP_BEAT_FROM_HBM" in event.get("name", "")
+            for event in trace_events
+        )
+        hbm_write_counter_event_count += sum(
+            "WR_REQ_BEAT_TO_HBM" in event.get("name", "")
+            for event in trace_events
+        )
+        cycle_counter_event_count += sum(
+            "CYCLE_COUNTER" in event.get("name", "") for event in trace_events
+        )
         process_names = {
             event["pid"]: event.get("args", {}).get("name", "")
-            for event in trace.get("traceEvents", [])
+            for event in trace_events
             if event.get("ph") == "M" and event.get("name") == "process_name"
         }
         device_pids = {
@@ -93,7 +131,7 @@ def inspect_profile(profile_directory: Path) -> dict[str, object]:
         }
         events = [
             event
-            for event in trace.get("traceEvents", [])
+            for event in trace_events
             if event.get("pid") in device_pids and event.get("ph") != "M"
         ]
         device_event_count += len(events)
@@ -108,15 +146,19 @@ def inspect_profile(profile_directory: Path) -> dict[str, object]:
                     str(pid): process_names[pid] for pid in sorted(device_pids)
                 },
                 "file": str(profile_file),
+                "trace_source": trace_source,
                 "tool_names": tool_names,
             }
         )
 
     return {
         "compiled_event_count": compiled_event_count,
+        "cycle_counter_event_count": cycle_counter_event_count,
         "device_event_count": device_event_count,
         "files": files,
         "profile_file_count": len(profile_files),
+        "hbm_read_counter_event_count": hbm_read_counter_event_count,
+        "hbm_write_counter_event_count": hbm_write_counter_event_count,
     }
 
 
@@ -136,6 +178,13 @@ def main() -> None:
         raise SystemExit("TPU_PROFILE_REJECTED reason=no_device_events")
     if args.require_compiled_program and result["compiled_event_count"] == 0:
         raise SystemExit("TPU_PROFILE_REJECTED reason=no_compiled_program_events")
+    if args.require_hbm_counters and (
+        result["hbm_read_counter_event_count"] == 0
+        or result["hbm_write_counter_event_count"] == 0
+    ):
+        raise SystemExit("TPU_PROFILE_REJECTED reason=no_hbm_counter_events")
+    if args.require_cycle_counters and result["cycle_counter_event_count"] == 0:
+        raise SystemExit("TPU_PROFILE_REJECTED reason=no_cycle_counter_events")
 
 
 if __name__ == "__main__":

@@ -11,6 +11,18 @@ from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
 logger = logging.getLogger(__name__)
 
+TPU_PERIODIC_COUNTER_CONFIGURATION = {
+    "tpu_enable_periodic_counter_sampling": True,
+    "tpu_tc_perf_counter_sampling_options": (
+        "interval_us:1 scaling:0 counter_size_bits:1 "
+        "indices:1 indices:3 indices:4 indices:10 indices:11 "
+        "indices:31 indices:32 indices:33 indices:34 indices:35 "
+        "indices:37 indices:38 indices:56 indices:57 indices:58 "
+        "indices:73 indices:74 indices:75 indices:105"
+    ),
+    "num_tensor_cores_to_trace_per_device": 1,
+}
+
 
 def _build_profiler_options(
     host_tracer_level: int | None,
@@ -33,8 +45,17 @@ def _build_profiler_options(
             advanced_configuration["tpu_trace_mode"] = trace_mode
         if chip_count := os.getenv("SGLANG_TPU_PROFILE_CHIP_COUNT"):
             advanced_configuration["tpu_num_chips_to_profile_per_task"] = int(chip_count)
-        if os.getenv("SGLANG_TPU_PERF_COUNTERS") == "1":
+        perf_counters = os.getenv("SGLANG_TPU_PERF_COUNTERS") == "1"
+        periodic_counters = os.getenv("SGLANG_TPU_PERIODIC_COUNTERS") == "1"
+        if perf_counters and periodic_counters:
+            raise ValueError(
+                "Choose either SGLANG_TPU_PERF_COUNTERS or "
+                "SGLANG_TPU_PERIODIC_COUNTERS, not both"
+            )
+        if perf_counters:
             advanced_configuration["tpu_perf_counters"] = True
+        if periodic_counters:
+            advanced_configuration.update(TPU_PERIODIC_COUNTER_CONFIGURATION)
         if advanced_configuration:
             options.advanced_configuration = advanced_configuration
     return options

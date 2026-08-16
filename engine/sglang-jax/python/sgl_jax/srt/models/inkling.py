@@ -152,10 +152,18 @@ class InklingShortConvolution(nnx.Module):
             )
         cumulative_lengths = None
         if sequence_lengths is not None:
+            sequence_lengths = jax.sharding.reshard(
+                sequence_lengths,
+                NamedSharding(self.mesh, P()),
+            )
             cumulative_lengths = jnp.concatenate(
                 (
                     jnp.zeros((1,), dtype=sequence_lengths.dtype),
-                    jnp.cumsum(sequence_lengths, dtype=sequence_lengths.dtype),
+                    jnp.cumsum(
+                        sequence_lengths,
+                        axis=0,
+                        dtype=sequence_lengths.dtype,
+                    ),
                 )
             )
         input_sharding = NamedSharding(self.mesh, P("data", "tensor"))
