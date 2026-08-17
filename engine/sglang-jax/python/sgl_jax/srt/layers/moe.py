@@ -12,6 +12,7 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
 from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
+from sgl_jax.srt.kernels.moe_restore import fused_restore_weight_reduce
 
 # Re-export for backward compatibility: external code imports from this module.
 from sgl_jax.srt.layers.fused_moe import FusedEPMoE, FusedEPMoEV2  # noqa: F401
@@ -736,29 +737,22 @@ class EPMoE(nnx.Module):
             .at[sorted_selected_experts]
             .set(jnp.arange(expected_tokens, dtype=jnp.int32))
         )
-        unsort_intermediate = jnp.take(intermediate, indices=argsort_indices, axis=0)
-
         total_tokens = weights.shape[0] * weights.shape[1] // self.num_experts_per_tok
 
         reshaped_weights = jnp.reshape(weights, (total_tokens, self.num_experts_per_tok))
-        reshaped_intermediate = jnp.reshape(
-            unsort_intermediate,
-            (total_tokens, self.num_experts_per_tok, -1),
-        )
-
-        intermediate_fp32 = reshaped_intermediate.astype(jnp.float32)
-        weights_fp32 = reshaped_weights.astype(jnp.float32)
-
-        output = jnp.einsum(
-            "BKE,BK -> BE",
-            intermediate_fp32,
-            weights_fp32,
+        output = fused_restore_weight_reduce(
+            intermediate,
+            argsort_indices,
+            reshaped_weights,
+            top_k=self.num_experts_per_tok,
+            interpret=jax.default_backend() != "tpu",
+            output_dtype=self.dtype,
         )
 
         if len(weights.shape) == 2:
-            final_output = output.astype(self.dtype)
+            final_output = output
         else:
-            final_output = output.reshape(batch_size, seq_len, -1).astype(self.dtype)
+            final_output = output.reshape(batch_size, seq_len, -1)
 
         return final_output
 
