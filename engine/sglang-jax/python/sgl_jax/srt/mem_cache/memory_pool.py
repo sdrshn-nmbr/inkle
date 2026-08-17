@@ -188,6 +188,7 @@ class ReqToTokenPool:
         for r in reqs:
             if r.req_pool_idx is None:
                 r.req_pool_idx = select_indices[offset]
+                r.request_pool_slot = int(r.req_pool_idx)
                 offset += 1
         return [r.req_pool_idx for r in reqs]
 
@@ -261,6 +262,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             if r.recurrent_pool_idx is None:
                 slot = self.alloc_recurrent_slot(dp_rank)
                 r.recurrent_pool_idx = slot
+                r.recurrent_state_slot = int(slot)
                 self.req_index_to_recurrent_index_mapping[r.req_pool_idx] = slot
                 if self.enable_recurrent_extra_buffer:
                     self._alloc_ping_pong_buffer(r, dp_rank)

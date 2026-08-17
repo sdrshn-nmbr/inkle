@@ -279,6 +279,8 @@ class DetokenizerManager:
 
         return BatchStrOut(
             rids=recv_obj.rids,
+            request_state_slots=recv_obj.request_state_slots,
+            recurrent_state_slots=recv_obj.recurrent_state_slots,
             finished_reasons=recv_obj.finished_reasons,
             output_strs=output_strs,
             output_ids=output_ids_list,

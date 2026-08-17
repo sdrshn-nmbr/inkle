@@ -1030,6 +1030,8 @@ class TokenizerManager:
                 "id": rid,
                 "finish_reason": recv_obj.finished_reasons[i],
                 "prompt_tokens": recv_obj.prompt_tokens[i],
+                "request_state_slot": recv_obj.request_state_slots[i],
+                "recurrent_state_slot": recv_obj.recurrent_state_slots[i],
             }
 
             if getattr(state.obj, "return_logprob", False) or getattr(

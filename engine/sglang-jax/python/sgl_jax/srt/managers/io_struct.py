@@ -50,6 +50,10 @@ class BaseReq:
 class BatchStrOut:
     # The request id
     rids: list[str]
+    # The request-to-state-pool slot used by the scheduler
+    request_state_slots: list[int]
+    # The persistent recurrent-state slot used by hybrid models
+    recurrent_state_slots: list[int | None]
     # The finish reason
     finished_reasons: list[dict]
     # The output decoded strings
@@ -90,6 +94,10 @@ class BatchStrOut:
 class BatchTokenIDOut:
     # The request id
     rids: list[str]
+    # The request-to-state-pool slot used by the scheduler
+    request_state_slots: list[int]
+    # The persistent recurrent-state slot used by hybrid models
+    recurrent_state_slots: list[int | None]
     # The finish reason
     finished_reasons: list[BaseFinishReason]
     # For incremental decoding

@@ -94,9 +94,11 @@ class TestReqToTokenPoolFree(CustomTestCase):
         self.pool.alloc([req])
         idx = req.req_pool_idx
         self.assertIsNotNone(idx)
+        self.assertEqual(req.request_pool_slot, idx)
 
         self.pool.free(req)
         self.assertIsNone(req.req_pool_idx)
+        self.assertEqual(req.request_pool_slot, idx)
         self.assertIn(idx, self.pool.free_slots, "freed slot must return to the pool")
 
         # Next alloc must hand out a slot again (any slot - identity not required).

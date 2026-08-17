@@ -238,6 +238,7 @@ def summarize(groups: list[dict[str, object]]) -> dict[str, object]:
         ]
         full_batch_metrics = [fully_active_metrics(group) for group in selected]
         output_signatures = [output_multiset_signature(group) for group in selected]
+        slot_output_signatures = [slot_output_signature(group) for group in selected]
         by_concurrency[str(concurrency)] = {
             "e2e_median_ms": statistics.median(e2e),
             "e2e_p95_ms": sorted(e2e)[max(0, int(len(e2e) * 0.95) - 1)],
@@ -253,6 +254,23 @@ def summarize(groups: list[dict[str, object]]) -> dict[str, object]:
                 metrics["throughput_tokens_per_second"] for metrics in full_batch_metrics
             ),
             "output_multiset_stable": len(set(output_signatures)) == 1,
+            "slot_output_mapping_stable": len(set(slot_output_signatures)) == 1,
+            "request_state_slots": sorted(
+                {
+                    request_state_slot(request)
+                    for group in selected
+                    for request in group["requests"]
+                    if request["chunks"]
+                }
+            ),
+            "recurrent_state_slots": sorted(
+                {
+                    request_recurrent_state_slot(request)
+                    for group in selected
+                    for request in group["requests"]
+                    if request["chunks"]
+                }
+            ),
         }
     return by_concurrency
 
@@ -288,6 +306,45 @@ def output_multiset_signature(group: dict[str, object]) -> tuple[str, ...]:
             hashlib.sha256(
                 request["chunks"][-1]["response"]["text"].encode()
             ).hexdigest()
+            for request in group["requests"]
+            if request["chunks"]
+        )
+    )
+
+
+def request_state_slot(request: dict[str, object]) -> int:
+    chunks = request["chunks"]
+    slots = {
+        chunk["response"]["meta_info"]["request_state_slot"] for chunk in chunks
+    }
+    if len(slots) != 1:
+        raise ValueError(f"Request changed state slots while decoding: {sorted(slots)}")
+    return slots.pop()
+
+
+def request_recurrent_state_slot(request: dict[str, object]) -> int:
+    chunks = request["chunks"]
+    slots = {
+        chunk["response"]["meta_info"]["recurrent_state_slot"] for chunk in chunks
+    }
+    if len(slots) != 1:
+        raise ValueError(f"Request changed recurrent-state slots: {sorted(slots)}")
+    slot = slots.pop()
+    if slot is None:
+        raise ValueError("Request has no recurrent-state slot")
+    return slot
+
+
+def slot_output_signature(group: dict[str, object]) -> tuple[tuple[int, int, str], ...]:
+    return tuple(
+        sorted(
+            (
+                request_state_slot(request),
+                request_recurrent_state_slot(request),
+                hashlib.sha256(
+                    request["chunks"][-1]["response"]["text"].encode()
+                ).hexdigest(),
+            )
             for request in group["requests"]
             if request["chunks"]
         )

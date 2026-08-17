@@ -230,6 +230,8 @@ class Req:
         # Memory pool info
         self.req_pool_idx: int | None = None
         self.recurrent_pool_idx: int | None = None
+        self.request_pool_slot: int | None = None
+        self.recurrent_state_slot: int | None = None
         # One-shot recurrent CoW src slot: set on a fresh match, consumed at the
         # next extend forward, cleared everywhere else (re-match, merge, retract).
         self.recurrent_cow_src_index: int | None = None

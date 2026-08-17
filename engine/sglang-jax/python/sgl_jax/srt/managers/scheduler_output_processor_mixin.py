@@ -755,6 +755,8 @@ class SchedulerOutputProcessorMixin:
         else:
             skip_ids = {id(skip_reqs)}
         rids = []
+        request_state_slots = []
+        recurrent_state_slots = []
         finished_reasons: list[BaseFinishReason] = []
 
         decoded_texts = []
@@ -832,8 +834,21 @@ class SchedulerOutputProcessorMixin:
                 if isinstance(req.rid, list):
                     # if rid is a list, extend the list to rids
                     rids.extend(req.rid)
+                    state_slot_count = len(req.rid)
                 else:
                     rids.append(req.rid)
+                    state_slot_count = 1
+                if req.request_pool_slot is None:
+                    raise RuntimeError(
+                        f"REQUEST_STATE_SLOT_MISSING rid={req.rid} output_tokens={len(req.output_ids)}"
+                    )
+                request_state_slots.extend([req.request_pool_slot] * state_slot_count)
+                recurrent_state_slot = (
+                    req.recurrent_state_slot
+                    if req.recurrent_state_slot is not None
+                    else None
+                )
+                recurrent_state_slots.extend([recurrent_state_slot] * state_slot_count)
                 finished_reasons.append(
                     req.finished_reason.to_json() if req.finished_reason else None
                 )
@@ -926,6 +941,8 @@ class SchedulerOutputProcessorMixin:
         if rids:
             out = BatchTokenIDOut(
                 rids,
+                request_state_slots,
+                recurrent_state_slots,
                 finished_reasons,
                 decoded_texts,
                 decode_ids_list,

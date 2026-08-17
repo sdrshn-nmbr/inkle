@@ -83,6 +83,8 @@ class TestHybridPoolAllocSingleDP(CustomTestCase):
         for req in reqs:
             self.assertIsNotNone(req.req_pool_idx)
             self.assertIsNotNone(req.recurrent_pool_idx)
+            self.assertEqual(req.request_pool_slot, req.req_pool_idx)
+            self.assertEqual(req.recurrent_state_slot, req.recurrent_pool_idx)
         self.assertNotEqual(reqs[0].recurrent_pool_idx, reqs[1].recurrent_pool_idx)
 
     def test_alloc_updates_mapping(self):
@@ -149,6 +151,8 @@ class TestHybridPoolFreeSingleDP(CustomTestCase):
 
         self.assertIsNone(req.req_pool_idx)
         self.assertIsNone(req.recurrent_pool_idx)
+        self.assertEqual(req.request_pool_slot, kv_idx)
+        self.assertEqual(req.recurrent_state_slot, recurrent_idx)
         self.assertIn(kv_idx, self.pool.free_slots)
         self.assertEqual(self.pool.recurrent_available_size(0), recurrent_avail_before + 1)
         self.assertIn(recurrent_idx, self.pool.recurrent_free_slots[0])
