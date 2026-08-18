@@ -72,6 +72,9 @@ def test_sliding_window_separates_buckets(monkeypatch):
         ),
     )
 
+    swa_key = ("d", 128, "bfloat16", "bfloat16", 32, 2, 256, 256, 64)
+    mod.TUNED_BLOCK_SIZES_V3["TPU v7"].pop(swa_key, None)
+
     # Add a non-SWA entry only
     mod.TUNED_BLOCK_SIZES_V3["TPU v7"][("d", None, "bfloat16", "bfloat16", 32, 2, 256, 256, 64)] = (
         1,
@@ -96,7 +99,7 @@ def test_sliding_window_separates_buckets(monkeypatch):
     )
 
     # Add SWA entry with different best
-    mod.TUNED_BLOCK_SIZES_V3["TPU v7"][("d", 128, "bfloat16", "bfloat16", 32, 2, 256, 256, 64)] = (
+    mod.TUNED_BLOCK_SIZES_V3["TPU v7"][swa_key] = (
         1,
         256,
         1,

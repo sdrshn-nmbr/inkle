@@ -21,8 +21,10 @@ pass --rank-to-stage so rank 0->d, rank 1->p, rank 2->m:
 import argparse
 import functools
 import itertools
+import json
 import os
 from math import inf
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -136,11 +138,11 @@ def _bq_candidates(max_q: int, stage: str) -> list[int]:
 
 def _bkv_candidates(page_size: int, kv_packing: int, max_kv: int) -> list[int]:
     alignment = max(page_size, kv_packing)
-    # Pruned from [256, 512, 1024, 2048, 4096, 8192, 16384, 32768]: based on
+    # Pruned from [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]: based on
     # 81 v6e + v7x winners observed so far, no entry has bkv >= 4096 ever
     # winning. Keep 4096 as upper-bound probe; drop 8192/16384/32768 to save
     # ~25% candidate count per cell.
-    raw = [256, 512, 1024, 2048, 4096]
+    raw = [128, 256, 512, 1024, 2048, 4096]
     out = []
     for v in raw:
         v = max(alignment, (v // alignment) * alignment)
@@ -156,12 +158,19 @@ def _enumerate_block_sizes(
     max_kv: int,
     page_size: int,
     kv_packing: int,
+    nested_compute_blocks: bool = False,
 ) -> list[tuple[int, int, int, int]]:
-    """csz==sz for both dims (nested attention loop disabled, matches v2)."""
     out = []
     for bq in _bq_candidates(max_q, stage):
         for bkv in _bkv_candidates(page_size, kv_packing, max_kv):
-            out.append((bq, bkv, bq, bkv))
+            bkv_compute = (
+                _bkv_candidates(page_size, kv_packing, bkv)
+                if nested_compute_blocks
+                else [bkv]
+            )
+            for bkv_csz in bkv_compute:
+                if bkv % bkv_csz == 0:
+                    out.append((bq, bkv, bq, bkv_csz))
     return out
 
 
@@ -285,6 +294,8 @@ def _benchmark_one(
     max_context_len,
     tries: int,
     sliding_window: int | None = None,
+    relative_dim: int = 0,
+    relative_extent: int = 0,
 ):
     inputs, rpa_case, chunk_prefill_size = _make_inputs(
         stage,
@@ -297,6 +308,20 @@ def _benchmark_one(
         max_context_len,
     )
     scale = head_dim**-0.5
+    relative_states = None
+    relative_projection = None
+    if relative_dim > 0:
+        relative_key, projection_key = jax.random.split(jax.random.PRNGKey(17))
+        relative_states = jax.random.normal(
+            relative_key,
+            (max_num_tokens, q_head_num, relative_dim),
+            dtype=jnp.bfloat16,
+        )
+        relative_projection = jax.random.normal(
+            projection_key,
+            (relative_dim, relative_extent),
+            dtype=jnp.bfloat16,
+        )
 
     block_kwarg_name = {
         "d": "d_block_sizes",
@@ -323,6 +348,8 @@ def _benchmark_one(
         cu_q_lens,
         cu_kv_lens,
         distribution,
+        relative_states,
+        relative_projection,
         sm_scale,
         **block_kwargs,
     ):
@@ -337,6 +364,8 @@ def _benchmark_one(
             cu_kv_lens,
             distribution,
             custom_mask=None,
+            relative_states=relative_states,
+            relative_projection=relative_projection,
             causal=1,
             sm_scale=sm_scale,
             sliding_window=sliding_window,
@@ -358,6 +387,8 @@ def _benchmark_one(
         inputs["cu_q_lens"],
         inputs["cu_kv_lens"],
         inputs["distribution"],
+        relative_states,
+        relative_projection,
         scale,
         **block_kwargs,
     )
@@ -431,11 +462,21 @@ def sweep(
     tries: int = 1,
     vmem_limit_bytes: int | None = None,
     sliding_window: int | None = None,
+    nested_compute_blocks: bool = False,
+    relative_dim: int = 0,
+    relative_extent: int = 0,
 ):
-    """Returns (best_4tuple, best_time, heuristic_4tuple, heuristic_time)."""
+    """Returns the winner, baseline, and every measured candidate."""
     kv_packing = get_dtype_packing(dtype)
-    max_kv = max_context_len
-    raw_candidates = _enumerate_block_sizes(stage, max_num_tokens, max_kv, page_size, kv_packing)
+    max_kv = min(max_context_len, sliding_window) if sliding_window else max_context_len
+    raw_candidates = _enumerate_block_sizes(
+        stage,
+        max_num_tokens,
+        max_kv,
+        page_size,
+        kv_packing,
+        nested_compute_blocks=nested_compute_blocks,
+    )
 
     if vmem_limit_bytes is None:
         vmem_limit_bytes = _default_vmem_limit()
@@ -480,6 +521,7 @@ def sweep(
     best_time = inf
     best = None
     heuristic_time = inf
+    measurements = []
     for bs in candidates:
         try:
             t = _benchmark_one(
@@ -494,8 +536,16 @@ def sweep(
                 max_context_len,
                 tries,
                 sliding_window=sliding_window,
+                relative_dim=relative_dim,
+                relative_extent=relative_extent,
             )
         except Exception as e:  # noqa: BLE001
+            measurements.append(
+                {
+                    "block_sizes": list(bs),
+                    "error": f"{type(e).__name__}: {e}",
+                }
+            )
             # The heuristic candidate is the production baseline; if even it
             # raises, the workload itself is broken (e.g., data-gen OOM) and
             # the whole sweep is meaningless. Surface the trace.
@@ -506,12 +556,13 @@ def sweep(
                     f"{type(e).__name__}: {e}"
                 )
             continue
+        measurements.append({"block_sizes": list(bs), "seconds": t})
         if bs == heuristic:
             heuristic_time = t
         if t < best_time:
             best_time = t
             best = bs
-    return best, best_time, heuristic, heuristic_time
+    return best, best_time, heuristic, heuristic_time, measurements
 
 
 _DEFAULT_PAGE_SIZES = (128, 256)
@@ -696,9 +747,20 @@ def main():
         "--write-threshold-pct",
         type=float,
         default=10.0,
-        help="only emit a table entry if tuned is faster than heuristic by ≥ this %",
+        help="only emit a table entry if tuned is faster than heuristic by this percent or more",
     )
+    parser.add_argument(
+        "--nested-compute-blocks",
+        action="store_true",
+        help="sweep smaller KV compute tiles inside each transferred KV block",
+    )
+    parser.add_argument("--relative-dim", type=int, default=0)
+    parser.add_argument("--relative-extent", type=int, default=0)
+    parser.add_argument("--json-output", default="")
     args = parser.parse_args()
+
+    if (args.relative_dim > 0) != (args.relative_extent > 0):
+        raise SystemExit("--relative-dim and --relative-extent must both be positive or both be 0")
 
     stages = _resolve_stages(args)
     for s in stages:
@@ -740,7 +802,7 @@ def main():
             )
             continue
         try:
-            best, best_t, heur, heur_t = sweep(
+            best, best_t, heur, heur_t, measurements = sweep(
                 stage,
                 ps,
                 q_h,
@@ -752,6 +814,9 @@ def main():
                 tries=args.tries,
                 vmem_limit_bytes=args.vmem_limit_bytes or None,
                 sliding_window=sw_arg,
+                nested_compute_blocks=args.nested_compute_blocks,
+                relative_dim=args.relative_dim,
+                relative_extent=args.relative_extent,
             )
         except Exception as e:  # noqa: BLE001
             print(f"# SKIP stage={stage} ps={ps} q={q_h} kv={kv_h} hd={hd} mnt={mnt}: {e}")
@@ -767,7 +832,7 @@ def main():
             continue
         delta_pct = (heur_t - best_t) / heur_t * 100.0
         table_key = _simplified_key_for_table(stage, q_h, kv_h, hd, ps, mnt, sliding_window=sw_arg)
-        rows.append((table_key, best, best_t, heur, heur_t, delta_pct))
+        rows.append((table_key, best, best_t, heur, heur_t, delta_pct, measurements))
         win = "WIN " if delta_pct >= args.write_threshold_pct else "skip"
         print(
             f"# [{win}] {table_key}: "
@@ -780,16 +845,41 @@ def main():
     print(
         f"# --- Paste into TUNED_BLOCK_SIZES_V3[{device!r}] (≥{args.write_threshold_pct}% win only) ---"
     )
-    for table_key, best, _, _, _, delta_pct in rows:
+    for table_key, best, _, _, _, delta_pct, _ in rows:
         if delta_pct >= args.write_threshold_pct:
             print(f"    {table_key}: {best},")
     print()
     print("# --- All measured (for audit) ---")
-    for table_key, best, best_t, heur, heur_t, delta_pct in rows:
+    for table_key, best, best_t, heur, heur_t, delta_pct, _ in rows:
         print(
             f"# {table_key}: best={best} ({best_t*1000:.4f}ms) "
             f"heur={heur} ({heur_t*1000:.4f}ms) Δ={delta_pct:+.1f}%"
         )
+
+    if args.json_output:
+        output = {
+            "device": device,
+            "stages": stages,
+            "sliding_window": sw_arg,
+            "relative_dim": args.relative_dim,
+            "relative_extent": args.relative_extent,
+            "nested_compute_blocks": args.nested_compute_blocks,
+            "rows": [
+                {
+                    "table_key": list(table_key),
+                    "best": list(best),
+                    "best_seconds": best_t,
+                    "heuristic": list(heur),
+                    "heuristic_seconds": heur_t,
+                    "improvement_pct": delta_pct,
+                    "measurements": measurements,
+                }
+                for table_key, best, best_t, heur, heur_t, delta_pct, measurements in rows
+            ],
+        }
+        path = Path(args.json_output)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(output, indent=2) + "\n")
 
 
 if __name__ == "__main__":
