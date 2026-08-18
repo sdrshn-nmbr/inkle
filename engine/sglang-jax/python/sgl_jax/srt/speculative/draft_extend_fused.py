@@ -14,6 +14,9 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.speculative.kernel import top_k_renorm_prob, top_p_renorm_prob
+from sgl_jax.srt.mem_cache.recurrent_state_pool import (
+    commit_convolution_transaction_buffers,
+)
 from sgl_jax.srt.sampling.sampling_params import TOP_K_ALL
 from sgl_jax.srt.speculative.relay_buffer import (
     gather_spec_relay_buffers,
@@ -856,7 +859,7 @@ def _build_verify(topk: int):
 
         target_state = jax.tree_util.tree_unflatten(target_model_state_def, target_leaves)
         target_model = nnx.merge(target_model_def, target_state)
-        target_output, target_pool_updates, _, _ = target_model(
+        target_output, target_pool_updates, recurrent_state_transaction, _ = target_model(
             target_forward_batch,
             target_memory_pools,
             target_logits_metadata,
@@ -908,6 +911,20 @@ def _build_verify(topk: int):
                 enable_top_p=enable_top_p,
                 speculative_num_steps=speculative_num_steps,
                 speculative_num_draft_tokens=speculative_num_draft_tokens,
+            )
+
+        if recurrent_state_transaction is not None:
+            recurrent_buffers, convolution_buffers = target_pool_updates["recurrent_state_pool"]
+            committed_convolution_buffers = commit_convolution_transaction_buffers(
+                tuple(tuple(layer) for layer in convolution_buffers),
+                recurrent_state_transaction.candidate_inputs,
+                recurrent_state_transaction.recurrent_indices,
+                prepared.accept_lens,
+                recurrent_state_transaction.draft_token_num,
+            )
+            target_pool_updates["recurrent_state_pool"] = (
+                recurrent_buffers,
+                committed_convolution_buffers,
             )
 
         target_logits_for_host = (

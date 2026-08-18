@@ -20,6 +20,7 @@ from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.moe import EPMoE, GateLogit, TopK
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
+from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentConvStateTransaction
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.models.inkling_layout import decode_nvfp4_numpy
 from sgl_jax.srt.utils.weight_utils import (
@@ -38,6 +39,13 @@ class InklingModelOutput(NamedTuple):
     auxiliary_hidden_states: tuple[jax.Array, ...]
     pool_updates: dict[str, object]
     layers_topk_ids: list[jax.Array | None]
+    recurrent_state_transaction: RecurrentConvStateTransaction | None
+
+
+class InklingConvolutionOutput(NamedTuple):
+    hidden_states: jax.Array
+    state_table: jax.Array | None
+    candidate_input: jax.Array | None
 
 
 def _text_config(config: PretrainedConfig) -> PretrainedConfig:
@@ -108,14 +116,14 @@ class InklingShortConvolution(nnx.Module):
         self.mesh = mesh
 
     def __call__(self, hidden_states: jax.Array, forward_batch: ForwardBatch) -> jax.Array:
-        return self.apply(hidden_states, forward_batch, None)[0]
+        return self.apply(hidden_states, forward_batch, None).hidden_states
 
     def apply(
         self,
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
         state_table: jax.Array | None,
-    ) -> tuple[jax.Array, jax.Array | None]:
+    ) -> InklingConvolutionOutput:
         if state_table is None and forward_batch.forward_mode != ForwardMode.EXTEND:
             raise ValueError(
                 "INKLING_CONV_CACHE_REQUIRED native decode needs persistent short-convolution state"
@@ -155,11 +163,24 @@ class InklingShortConvolution(nnx.Module):
                     cache,
                     jnp.zeros_like(cache),
                 )
-            sequence_lengths = (
-                forward_batch.extend_seq_lens
-                if forward_batch.forward_mode == ForwardMode.EXTEND
-                else None
-            )
+            if forward_batch.forward_mode.is_target_verify():
+                spec_info = forward_batch.spec_info
+                if spec_info is None or spec_info.topk != 1:
+                    raise ValueError(
+                        "INKLING_RECURRENT_VERIFY_REQUIRES_FIXED_CHAIN "
+                        f"topk={None if spec_info is None else spec_info.topk}"
+                    )
+                sequence_lengths = jnp.full(
+                    (forward_batch.batch_size,),
+                    spec_info.draft_token_num,
+                    dtype=jnp.int32,
+                )
+            else:
+                sequence_lengths = (
+                    forward_batch.extend_seq_lens
+                    if forward_batch.forward_mode == ForwardMode.EXTEND
+                    else None
+                )
         cumulative_lengths = None
         if sequence_lengths is not None:
             sequence_lengths = jax.sharding.reshard(
@@ -205,7 +226,11 @@ class InklingShortConvolution(nnx.Module):
             )
         output = (convolved + convolution_input).astype(hidden_states.dtype)
         output = jax.sharding.reshard(output, input_sharding)
-        return output, new_state_table
+        candidate_input = None
+        if state_table is not None and forward_batch.forward_mode.is_target_verify():
+            candidate_input = convolution_input.astype(state_table.dtype)
+            new_state_table = state_table
+        return InklingConvolutionOutput(output, new_state_table, candidate_input)
 
 
 class InklingDenseMLP(nnx.Module):
@@ -498,7 +523,12 @@ class InklingAttention(nnx.Module):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         convolution_states: tuple[jax.Array, jax.Array] | None = None,
-    ) -> tuple[jax.Array, jax.Array, tuple[jax.Array, jax.Array] | None]:
+    ) -> tuple[
+        jax.Array,
+        jax.Array,
+        tuple[jax.Array, jax.Array] | None,
+        tuple[jax.Array, jax.Array] | None,
+    ]:
         token_count = hidden_states.shape[0]
         query = stable_bfloat16_linear(self.q_proj, hidden_states)
         key = stable_bfloat16_linear(self.k_proj, hidden_states)
@@ -506,8 +536,10 @@ class InklingAttention(nnx.Module):
         relative = stable_bfloat16_linear(self.r_proj, hidden_states)
         key_state = convolution_states[0] if convolution_states is not None else None
         value_state = convolution_states[1] if convolution_states is not None else None
-        key, new_key_state = self.k_sconv.apply(key, forward_batch, key_state)
-        value, new_value_state = self.v_sconv.apply(value, forward_batch, value_state)
+        key_conv = self.k_sconv.apply(key, forward_batch, key_state)
+        value_conv = self.v_sconv.apply(value, forward_batch, value_state)
+        key = key_conv.hidden_states
+        value = value_conv.hidden_states
 
         query = self.q_norm(query.reshape(token_count, self.num_heads, self.head_dim))
         key = self.k_norm(key.reshape(token_count, self.num_kv_heads, self.head_dim))
@@ -533,9 +565,12 @@ class InklingAttention(nnx.Module):
         )
         output = stable_bfloat16_linear(self.o_proj, attended)
         state_updates = None
+        candidate_inputs = None
         if convolution_states is not None:
-            state_updates = (new_key_state, new_value_state)
-        return output, kv_fused, state_updates
+            state_updates = (key_conv.state_table, value_conv.state_table)
+            if key_conv.candidate_input is not None:
+                candidate_inputs = (key_conv.candidate_input, value_conv.candidate_input)
+        return output, kv_fused, state_updates, candidate_inputs
 
 
 class InklingDecoderLayer(nnx.Module):
@@ -580,6 +615,7 @@ class InklingDecoderLayer(nnx.Module):
         jax.Array,
         jax.Array | None,
         list[jax.Array] | None,
+        tuple[jax.Array, ...] | None,
     ]:
         residual = hidden_states
         normalized = self.input_layernorm(hidden_states)
@@ -588,7 +624,7 @@ class InklingDecoderLayer(nnx.Module):
             if convolution_states is not None
             else None
         )
-        attended, kv_fused, attention_state_updates = self.self_attn(
+        attended, kv_fused, attention_state_updates, attention_candidate_inputs = self.self_attn(
             positions,
             normalized,
             forward_batch,
@@ -596,9 +632,8 @@ class InklingDecoderLayer(nnx.Module):
             attention_states,
         )
         attn_state = convolution_states[2] if convolution_states is not None else None
-        convolved_attention, new_attn_state = self.attn_sconv.apply(
-            attended, forward_batch, attn_state
-        )
+        attn_conv = self.attn_sconv.apply(attended, forward_batch, attn_state)
+        convolved_attention = attn_conv.hidden_states
         hidden_states = residual + convolved_attention
 
         residual = hidden_states
@@ -612,17 +647,26 @@ class InklingDecoderLayer(nnx.Module):
                 NamedSharding(self.mesh, P("data", None)),
             )
         mlp_state = convolution_states[3] if convolution_states is not None else None
-        convolved_mlp, new_mlp_state = self.mlp_sconv.apply(transformed, forward_batch, mlp_state)
+        mlp_conv = self.mlp_sconv.apply(transformed, forward_batch, mlp_state)
+        convolved_mlp = mlp_conv.hidden_states
         hidden_states = residual + convolved_mlp
         state_updates = None
         if convolution_states is not None:
             state_updates = [
                 attention_state_updates[0],
                 attention_state_updates[1],
-                new_attn_state,
-                new_mlp_state,
+                attn_conv.state_table,
+                mlp_conv.state_table,
             ]
-        return hidden_states, kv_fused, topk_ids, state_updates
+        candidate_inputs = None
+        if attention_candidate_inputs is not None:
+            candidate_inputs = (
+                attention_candidate_inputs[0],
+                attention_candidate_inputs[1],
+                attn_conv.candidate_input,
+                mlp_conv.candidate_input,
+            )
+        return hidden_states, kv_fused, topk_ids, state_updates, candidate_inputs
 
 
 class InklingModel(nnx.Module):
@@ -661,6 +705,7 @@ class InklingModel(nnx.Module):
         layers_kv_fused = []
         layers_topk_ids = []
         auxiliary_hidden_states = []
+        recurrent_candidate_inputs = []
         recurrent_state_pool = getattr(memory_pools, "recurrent_state_pool", None)
         conv_updates = None
         if recurrent_state_pool is not None:
@@ -670,7 +715,7 @@ class InklingModel(nnx.Module):
             if recurrent_state_pool is not None:
                 layer_index = recurrent_state_pool.layers_mapping[layer.layer_id]
                 layer_states = conv_updates[layer_index]
-            hidden_states, kv_fused, topk_ids, state_updates = layer(
+            hidden_states, kv_fused, topk_ids, state_updates, candidate_inputs = layer(
                 forward_batch.positions,
                 hidden_states,
                 forward_batch,
@@ -683,17 +728,27 @@ class InklingModel(nnx.Module):
                 auxiliary_hidden_states.append(hidden_states)
             if state_updates is not None:
                 conv_updates[layer_index] = state_updates
+            if candidate_inputs is not None:
+                recurrent_candidate_inputs.append(candidate_inputs)
         pool_updates = {"token_to_kv_pool": layers_kv_fused}
         if recurrent_state_pool is not None:
             pool_updates["recurrent_state_pool"] = (
                 list(recurrent_state_pool.recurrent_buffers),
                 conv_updates,
             )
+        recurrent_state_transaction = None
+        if recurrent_candidate_inputs:
+            recurrent_state_transaction = RecurrentConvStateTransaction(
+                candidate_inputs=tuple(recurrent_candidate_inputs),
+                recurrent_indices=forward_batch.recurrent_indices,
+                draft_token_num=forward_batch.spec_info.draft_token_num,
+            )
         return InklingModelOutput(
             hidden_states=self.norm(hidden_states),
             auxiliary_hidden_states=tuple(auxiliary_hidden_states),
             pool_updates=pool_updates,
             layers_topk_ids=layers_topk_ids,
+            recurrent_state_transaction=recurrent_state_transaction,
         )
 
 
@@ -761,7 +816,7 @@ class InklingForCausalLM(nnx.Module):
         return (
             output,
             model_output.pool_updates,
-            True,
+            model_output.recurrent_state_transaction,
             model_output.layers_topk_ids,
         )
 

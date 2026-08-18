@@ -15,6 +15,7 @@ from sgl_jax.srt.utils.jax_utils import device_array
 from sgl_jax.srt.utils.profiling_utils import named_scope
 
 if TYPE_CHECKING:
+    from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentConvStateTransaction
     from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
     from sgl_jax.srt.model_executor.forward_batch_info import (
         CaptureHiddenMode,
@@ -31,6 +32,8 @@ class LogitsProcessorOutput:
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
     hidden_states: jax.Array | None = None
+    # Temporary recurrent state produced by fixed-chain target verification.
+    recurrent_state_transaction: "RecurrentConvStateTransaction | None" = None
 
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
     # The logprobs of the next tokens.                              shape: [#seq]
@@ -56,6 +59,7 @@ class LogitsProcessorOutput:
         children = (
             self.next_token_logits,
             self.hidden_states,
+            self.recurrent_state_transaction,
             self.next_token_logprobs,
             self.input_token_logprobs,
             self.next_token_top_logprobs_val,
@@ -77,17 +81,18 @@ class LogitsProcessorOutput:
 
         obj.next_token_logits = children[0]
         obj.hidden_states = children[1]
-        obj.next_token_logprobs = children[2]
-        obj.input_token_logprobs = children[3]
+        obj.recurrent_state_transaction = children[2]
+        obj.next_token_logprobs = children[3]
+        obj.input_token_logprobs = children[4]
 
-        obj.next_token_top_logprobs_val = children[4]
-        obj.next_token_top_logprobs_idx = children[5]
-        obj.next_token_token_ids_logprobs_val = children[6]
-        obj.next_token_token_ids_logprobs_idx = children[7]
-        obj.input_top_logprobs_val = children[8]
-        obj.input_top_logprobs_idx = children[9]
-        obj.input_token_ids_logprobs_val = children[10]
-        obj.input_token_ids_logprobs_idx = children[11]
+        obj.next_token_top_logprobs_val = children[5]
+        obj.next_token_top_logprobs_idx = children[6]
+        obj.next_token_token_ids_logprobs_val = children[7]
+        obj.next_token_token_ids_logprobs_idx = children[8]
+        obj.input_top_logprobs_val = children[9]
+        obj.input_top_logprobs_idx = children[10]
+        obj.input_token_ids_logprobs_val = children[11]
+        obj.input_token_ids_logprobs_idx = children[12]
 
         return obj
 

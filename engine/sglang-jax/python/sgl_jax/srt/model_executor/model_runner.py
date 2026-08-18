@@ -628,8 +628,8 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         _kv_lock = getattr(self.token_to_kv_pool, "_donate_lock", None)
         with _kv_lock if _kv_lock is not None else contextlib.nullcontext():
             with jtu.count_pjit_cpp_cache_miss() as count:
-                output, pool_updates, _, layers_topk_ids = self.jitted_run_model(
-                    forward_batch, logits_metadata
+                output, pool_updates, recurrent_state_transaction, layers_topk_ids = (
+                    self.jitted_run_model(forward_batch, logits_metadata)
                 )
                 cache_miss_count = count()
 
@@ -639,6 +639,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 target_sharding = self.token_to_kv_pool.kv_sharding
                 pool_updates = [jax.device_put(kv, target_sharding) for kv in pool_updates]
             self.memory_pools.replace_all(pool_updates)
+            output.recurrent_state_transaction = recurrent_state_transaction
 
         # layers_topk_ids required real_bs and original_input_len which could not be stored in ForwardBatch
         return output, cache_miss_count, layers_topk_ids
@@ -739,6 +740,23 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             logits_output,
             sampling_metadata,
         )
+
+    def commit_recurrent_state_transaction(
+        self,
+        logits_output: LogitsProcessorOutput,
+        accepted_lengths: np.ndarray,
+    ) -> None:
+        transaction = logits_output.recurrent_state_transaction
+        if transaction is None:
+            return
+        recurrent_state_pool = getattr(self.memory_pools, "recurrent_state_pool", None)
+        if recurrent_state_pool is None:
+            raise ValueError("RECURRENT_TRANSACTION_POOL_MISSING")
+        recurrent_state_pool.commit_convolution_transaction(
+            transaction,
+            jnp.asarray(accepted_lengths, dtype=jnp.int32),
+        )
+        logits_output.recurrent_state_transaction = None
 
     def compute_logprobs(self, logits, token_ids: jax.Array) -> jax.Array:
         return self.jitted_compute_logprobs(logits, token_ids)

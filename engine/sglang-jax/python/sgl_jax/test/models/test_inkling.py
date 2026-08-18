@@ -18,7 +18,11 @@ from sgl_jax.srt.layers.attention.native_backend import compact_page_aligned_cac
 from sgl_jax.srt.layers.attention.native_backend import relative_position_bias
 from sgl_jax.srt.layers.attention.native_backend import NativeAttention
 from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool
-from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
+from sgl_jax.srt.mem_cache.recurrent_state_pool import (
+    RecurrentConvStateTransaction,
+    RecurrentStatePool,
+    commit_packed_convolution_state,
+)
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.models.inkling import (
     INKLING_SMALL_DSPARK_TARGET_LAYER_IDS,
@@ -177,7 +181,7 @@ class TestInklingModel(unittest.TestCase):
                 _token_to_kv_pool,
                 _layer_states,
             ):
-                return hidden_states + self.layer_id + 1, None, None, None
+                return hidden_states + self.layer_id + 1, None, None, None, None
 
         model = InklingForCausalLM(make_config(), MESH, dtype=jnp.float32)
         model.model.layers = nnx.data([AddLayer(layer_id) for layer_id in range(3)])
@@ -445,7 +449,7 @@ class TestInklingModel(unittest.TestCase):
             extend_seq_lens=jnp.asarray([4], dtype=jnp.int32),
             recurrent_indices=None,
         )
-        one_shot, _ = convolution.apply(hidden, one_shot_batch, None)
+        one_shot = convolution.apply(hidden, one_shot_batch, None).hidden_states
 
         state = jnp.zeros((2, 4, 3), dtype=jnp.float32)
         prompt_batch = SimpleNamespace(
@@ -454,13 +458,15 @@ class TestInklingModel(unittest.TestCase):
             extend_seq_lens=jnp.asarray([3], dtype=jnp.int32),
             recurrent_indices=jnp.asarray([1], dtype=jnp.int32),
         )
-        prompt, state = convolution.apply(hidden[:3], prompt_batch, state)
+        prompt_result = convolution.apply(hidden[:3], prompt_batch, state)
+        prompt, state = prompt_result.hidden_states, prompt_result.state_table
         decode_batch = SimpleNamespace(
             forward_mode=ForwardMode.DECODE,
             extend_seq_lens=None,
             recurrent_indices=jnp.asarray([1], dtype=jnp.int32),
         )
-        decoded, state = convolution.apply(hidden[3:], decode_batch, state)
+        decode_result = convolution.apply(hidden[3:], decode_batch, state)
+        decoded, state = decode_result.hidden_states, decode_result.state_table
 
         np.testing.assert_allclose(
             np.concatenate((np.asarray(prompt), np.asarray(decoded))),
@@ -475,12 +481,134 @@ class TestInklingModel(unittest.TestCase):
             rtol=0,
             atol=0,
         )
-        repeated_prompt, _ = convolution.apply(hidden[:3], prompt_batch, state)
+        repeated_prompt = convolution.apply(hidden[:3], prompt_batch, state).hidden_states
         np.testing.assert_allclose(
             np.asarray(repeated_prompt),
             np.asarray(prompt),
             rtol=0,
             atol=1e-6,
+        )
+
+    def test_candidate_convolution_state_commits_only_accepted_prefix(self):
+        old_state = jnp.asarray(
+            [
+                [[0, 0, 0], [0, 0, 0]],
+                [[10, 11, 12], [20, 21, 22]],
+                [[30, 31, 32], [40, 41, 42]],
+            ],
+            dtype=jnp.bfloat16,
+        )
+        candidates = jnp.asarray(
+            [[100, 200], [101, 201], [102, 202], [300, 400], [301, 401], [302, 402]],
+            dtype=jnp.bfloat16,
+        )
+
+        committed = commit_packed_convolution_state(
+            old_state,
+            candidates,
+            recurrent_indices=jnp.asarray([1, 2], dtype=jnp.int32),
+            accepted_lengths=jnp.asarray([1, 3], dtype=jnp.int32),
+            draft_token_num=3,
+        )
+
+        np.testing.assert_array_equal(np.asarray(committed[0]), np.asarray(old_state[0]))
+        np.testing.assert_array_equal(
+            np.asarray(committed[1]),
+            np.asarray([[11, 12, 100], [21, 22, 200]], dtype=np.float32),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(committed[2]),
+            np.asarray(candidates[3:].T),
+        )
+
+    def test_target_verify_keeps_candidate_convolution_state_temporary(self):
+        convolution = InklingShortConvolution(4, 4, MESH)
+        convolution.weight = nnx.Param(jnp.ones((4, 4), dtype=jnp.float32))
+        old_state = jnp.arange(24, dtype=jnp.float32).reshape(2, 4, 3)
+        hidden = jnp.arange(12, dtype=jnp.float32).reshape(3, 4)
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            batch_size=1,
+            recurrent_indices=jnp.asarray([1], dtype=jnp.int32),
+            spec_info=SimpleNamespace(topk=1, draft_token_num=3),
+        )
+
+        result = convolution.apply(hidden, batch, old_state)
+
+        np.testing.assert_array_equal(np.asarray(result.state_table), np.asarray(old_state))
+        np.testing.assert_array_equal(np.asarray(result.candidate_input), np.asarray(hidden))
+        committed = commit_packed_convolution_state(
+            result.state_table,
+            result.candidate_input,
+            batch.recurrent_indices,
+            jnp.asarray([2], dtype=jnp.int32),
+            draft_token_num=3,
+        )
+        np.testing.assert_array_equal(
+            np.asarray(committed[1]),
+            np.asarray(
+                [
+                    [14, 0, 4],
+                    [17, 1, 5],
+                    [20, 2, 6],
+                    [23, 3, 7],
+                ],
+                dtype=np.float32,
+            ),
+        )
+
+    def test_target_verify_rejects_branching_convolution_histories(self):
+        convolution = InklingShortConvolution(4, 4, MESH)
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            batch_size=1,
+            recurrent_indices=jnp.asarray([1], dtype=jnp.int32),
+            spec_info=SimpleNamespace(topk=2, draft_token_num=3),
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "INKLING_RECURRENT_VERIFY_REQUIRES_FIXED_CHAIN",
+        ):
+            convolution.apply(
+                jnp.zeros((3, 4), dtype=jnp.float32),
+                batch,
+                jnp.zeros((2, 4, 3), dtype=jnp.float32),
+            )
+
+    def test_recurrent_pool_commits_all_convolution_histories_atomically(self):
+        pool = RecurrentStatePool(
+            linear_recurrent_layer_ids=[0],
+            size=1,
+            num_heads=1,
+            head_dim=1,
+            conv_kernel_size=4,
+            mesh=MESH,
+            conv_channel_sizes=[[2, 2]],
+            has_temporal_state=False,
+        )
+        pool.conv_buffers = [
+            [
+                jnp.zeros((2, 2, 3), dtype=jnp.bfloat16),
+                jnp.zeros((2, 2, 3), dtype=jnp.bfloat16),
+            ]
+        ]
+        first = jnp.asarray([[1, 10], [2, 20], [3, 30]], dtype=jnp.bfloat16)
+        second = first + jnp.asarray(100, dtype=jnp.bfloat16)
+        transaction = RecurrentConvStateTransaction(
+            candidate_inputs=((first, second),),
+            recurrent_indices=jnp.asarray([1], dtype=jnp.int32),
+            draft_token_num=3,
+        )
+
+        pool.commit_convolution_transaction(transaction, jnp.asarray([2], dtype=jnp.int32))
+
+        np.testing.assert_array_equal(
+            np.asarray(pool.conv_buffers[0][0][1]),
+            np.asarray([[0, 1, 2], [0, 10, 20]], dtype=np.float32),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(pool.conv_buffers[0][1][1]),
+            np.asarray([[0, 101, 102], [0, 110, 120]], dtype=np.float32),
         )
 
     def test_short_convolution_can_be_traced(self):
@@ -539,13 +667,14 @@ class TestInklingModel(unittest.TestCase):
             extend_seq_lens=jnp.asarray([3], dtype=jnp.int32),
         )
         hidden = jnp.arange(3 * 512, dtype=jnp.float32).reshape(3, 512).astype(jnp.bfloat16)
-        output, kv_fused, topk_ids, conv_updates = model.model.layers[0](
+        output, kv_fused, topk_ids, conv_updates, candidate_inputs = model.model.layers[0](
             batch.positions, hidden, batch, pool
         )
         self.assertEqual(output.shape, hidden.shape)
         self.assertEqual(kv_fused.ndim, 5)
         self.assertIsNone(topk_ids)
         self.assertIsNone(conv_updates)
+        self.assertIsNone(candidate_inputs)
         self.assertTrue(np.isfinite(np.asarray(output, dtype=np.float32)).all())
 
     def test_dense_layer_prompt_then_decode_matches_one_shot(self):
@@ -591,7 +720,7 @@ class TestInklingModel(unittest.TestCase):
             ]
 
         one_shot_batch = make_batch(ForwardMode.EXTEND, [0, 1, 2, 3], [1, 2, 3, 4], [1, 2, 3, 4], 4)
-        one_shot, _, _, _ = layer(
+        one_shot, _, _, _, _ = layer(
             one_shot_batch.positions,
             hidden,
             one_shot_batch,
@@ -601,7 +730,7 @@ class TestInklingModel(unittest.TestCase):
 
         split_pool = make_pool()
         prompt_batch = make_batch(ForwardMode.EXTEND, [0, 1, 2], [1, 2, 3], [1, 2, 3], 3)
-        _, prompt_kv, _, states = layer(
+        _, prompt_kv, _, states, _ = layer(
             prompt_batch.positions,
             hidden[:3],
             prompt_batch,
@@ -610,7 +739,7 @@ class TestInklingModel(unittest.TestCase):
         )
         split_pool.replace_buffer([prompt_kv])
         decode_batch = make_batch(ForwardMode.DECODE, [3], [4], [1, 2, 3, 4], 4)
-        decoded, _, _, _ = layer(
+        decoded, _, _, _, _ = layer(
             decode_batch.positions,
             hidden[3:],
             decode_batch,

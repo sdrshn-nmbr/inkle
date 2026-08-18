@@ -68,6 +68,100 @@ class LinearRecurrentStateParams:
     has_temporal_state: bool = True
 
 
+@register_pytree_node_class
+@dataclass(frozen=True)
+class RecurrentConvStateTransaction:
+    """Temporary convolution inputs produced by fixed-chain target verification."""
+
+    candidate_inputs: tuple[tuple[jax.Array, ...], ...]
+    recurrent_indices: jax.Array
+    draft_token_num: int
+
+    def tree_flatten(self):
+        return (self.candidate_inputs, self.recurrent_indices), self.draft_token_num
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        candidate_inputs, recurrent_indices = children
+        return cls(candidate_inputs, recurrent_indices, aux_data)
+
+
+def commit_packed_convolution_state(
+    state_table: jax.Array,
+    candidate_inputs: jax.Array,
+    recurrent_indices: jax.Array,
+    accepted_lengths: jax.Array,
+    draft_token_num: int,
+) -> jax.Array:
+    """Commit only each request's accepted fixed-chain candidate prefix."""
+    batch_size = recurrent_indices.shape[0]
+    if candidate_inputs.shape[0] != batch_size * draft_token_num:
+        raise ValueError(
+            "RECURRENT_CANDIDATE_LAYOUT_MISMATCH "
+            f"tokens={candidate_inputs.shape[0]} batch={batch_size} "
+            f"draft_token_num={draft_token_num}"
+        )
+    if accepted_lengths.shape != recurrent_indices.shape:
+        raise ValueError(
+            "RECURRENT_ACCEPT_LENGTH_SHAPE_MISMATCH "
+            f"accepted={accepted_lengths.shape} indices={recurrent_indices.shape}"
+        )
+
+    cache_width = state_table.shape[-1]
+    state_sharding = jax.typeof(state_table).sharding
+    candidates = candidate_inputs.reshape(
+        batch_size,
+        draft_token_num,
+        candidate_inputs.shape[-1],
+    ).swapaxes(1, 2)
+    candidates = jax.sharding.reshard(candidates, state_sharding)
+    safe_indices = jnp.maximum(recurrent_indices, 0)
+    old_rows = state_table.at[safe_indices].get(out_sharding=state_sharding)
+    history = jnp.concatenate((old_rows, candidates.astype(state_table.dtype)), axis=-1)
+    accepted_lengths = jnp.clip(accepted_lengths, 0, draft_token_num)
+    history_indices = (
+        accepted_lengths[:, None] + jnp.arange(cache_width, dtype=accepted_lengths.dtype)[None, :]
+    )
+    committed_rows = jnp.take_along_axis(history, history_indices[:, None, :], axis=2)
+    updated = state_table.at[safe_indices].set(
+        committed_rows,
+        out_sharding=state_sharding,
+    )
+    row_zero = state_table.at[0].get(
+        out_sharding=NamedSharding(state_sharding.mesh, P("tensor", None))
+    )
+    return updated.at[0].set(row_zero, out_sharding=state_sharding)
+
+
+def commit_convolution_transaction_buffers(
+    conv_buffers: tuple[tuple[jax.Array, ...], ...],
+    candidate_inputs: tuple[tuple[jax.Array, ...], ...],
+    recurrent_indices: jax.Array,
+    accepted_lengths: jax.Array,
+    draft_token_num: int,
+) -> tuple[tuple[jax.Array, ...], ...]:
+    return tuple(
+        tuple(
+            commit_packed_convolution_state(
+                state_table,
+                candidates,
+                recurrent_indices,
+                accepted_lengths,
+                draft_token_num,
+            )
+            for candidates, state_table in zip(layer_candidates, layer_buffers, strict=True)
+        )
+        for layer_candidates, layer_buffers in zip(candidate_inputs, conv_buffers, strict=True)
+    )
+
+
+_jitted_commit_convolution_transaction_buffers = jax.jit(
+    commit_convolution_transaction_buffers,
+    static_argnames=("draft_token_num",),
+    donate_argnames=("conv_buffers",),
+)
+
+
 def recurrent_state_dtype() -> RecurrentStateDType:
     return RecurrentStateDType(
         conv=_resolve_dtype("SGLANG_JAX_CONV_STATE_DTYPE", jnp.bfloat16),
@@ -324,6 +418,42 @@ class RecurrentStatePool:
             for inner in self.conv_buffers
         ]
         return new_recurrent, new_conv
+
+    def commit_convolution_transaction(
+        self,
+        transaction: RecurrentConvStateTransaction,
+        accepted_lengths: jax.Array,
+    ) -> None:
+        if len(transaction.candidate_inputs) != len(self.conv_buffers):
+            raise ValueError(
+                "RECURRENT_TRANSACTION_LAYER_MISMATCH "
+                f"candidates={len(transaction.candidate_inputs)} "
+                f"buffers={len(self.conv_buffers)}"
+            )
+        accepted_lengths = jax.device_put(
+            accepted_lengths,
+            NamedSharding(self.mesh, P(self.data_partition_axis)),
+        )
+        recurrent_indices = jax.sharding.reshard(
+            transaction.recurrent_indices,
+            NamedSharding(self.mesh, P(self.data_partition_axis)),
+        )
+        for layer_candidates, layer_buffers in zip(
+            transaction.candidate_inputs, self.conv_buffers, strict=True
+        ):
+            if len(layer_candidates) != len(layer_buffers):
+                raise ValueError(
+                    "RECURRENT_TRANSACTION_CONV_MISMATCH "
+                    f"candidates={len(layer_candidates)} buffers={len(layer_buffers)}"
+                )
+        new_conv = _jitted_commit_convolution_transaction_buffers(
+            tuple(tuple(layer) for layer in self.conv_buffers),
+            transaction.candidate_inputs,
+            recurrent_indices,
+            accepted_lengths,
+            transaction.draft_token_num,
+        )
+        self.conv_buffers = [list(layer) for layer in new_conv]
 
     # --- pytree ---
     def tree_flatten(self):

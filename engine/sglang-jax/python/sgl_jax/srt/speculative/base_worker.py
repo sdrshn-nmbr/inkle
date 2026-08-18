@@ -334,6 +334,10 @@ class BaseSpecWorker:
             self.draft_worker.draft_model_runner.rngs,
             self.mesh,
         )
+        self.target_worker.model_runner.commit_recurrent_state_transaction(
+            logits_output,
+            accept_length,
+        )
         legacy_non_overlap = use_legacy_eagle3_non_overlap(
             not self.server_args.disable_overlap_schedule,
             getattr(model_worker_batch, "spec_algorithm", None),
