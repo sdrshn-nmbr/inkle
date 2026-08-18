@@ -21,6 +21,7 @@ from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.models.inkling import (
+    INKLING_SMALL_DSPARK_TARGET_LAYER_IDS,
     InklingDenseMLP,
     InklingForCausalLM,
     InklingMoE,
@@ -163,6 +164,60 @@ class TestInklingLayout(unittest.TestCase):
 
 
 class TestInklingModel(unittest.TestCase):
+    def test_dspark_capture_returns_exact_post_layer_states(self):
+        class AddLayer(nnx.Module):
+            def __init__(self, layer_id: int):
+                self.layer_id = layer_id
+
+            def __call__(
+                self,
+                _positions,
+                hidden_states,
+                _forward_batch,
+                _token_to_kv_pool,
+                _layer_states,
+            ):
+                return hidden_states + self.layer_id + 1, None, None, None
+
+        model = InklingForCausalLM(make_config(), MESH, dtype=jnp.float32)
+        model.model.layers = nnx.data([AddLayer(layer_id) for layer_id in range(3)])
+        model.set_dspark_layers_to_capture([0, 2])
+        output = model.model(
+            SimpleNamespace(
+                input_ids=jnp.asarray([1, 2], dtype=jnp.int32),
+                positions=jnp.asarray([0, 1], dtype=jnp.int32),
+            ),
+            SimpleNamespace(token_to_kv_pool=object()),
+        )
+
+        self.assertEqual(model.model.layers_to_capture, (0, 2))
+        self.assertEqual(len(output.auxiliary_hidden_states), 2)
+        np.testing.assert_allclose(
+            np.asarray(output.auxiliary_hidden_states[1] - output.auxiliary_hidden_states[0]),
+            5.0,
+            rtol=0,
+            atol=1e-6,
+        )
+
+    def test_dspark_capture_defaults_to_checkpoint_layer_contract(self):
+        config = make_config(num_layers=40)
+        model = InklingForCausalLM(config, MESH, dtype=jnp.bfloat16)
+
+        model.set_dspark_layers_to_capture()
+
+        self.assertEqual(
+            model.model.layers_to_capture,
+            INKLING_SMALL_DSPARK_TARGET_LAYER_IDS,
+        )
+
+    def test_dspark_capture_rejects_invalid_layers(self):
+        model = InklingForCausalLM(make_config(), MESH, dtype=jnp.bfloat16)
+
+        with self.assertRaisesRegex(ValueError, "INKLING_DUPLICATE_CAPTURE_LAYERS"):
+            model.set_dspark_layers_to_capture([1, 1])
+        with self.assertRaisesRegex(ValueError, "INKLING_CAPTURE_LAYER_OUT_OF_RANGE"):
+            model.set_dspark_layers_to_capture([3])
+
     def test_padded_vocabulary_rows_are_masked_without_slicing(self):
         model = InklingForCausalLM(
             make_config(num_layers=1),
@@ -433,9 +488,7 @@ class TestInklingModel(unittest.TestCase):
         hidden_sharding = jax.sharding.NamedSharding(
             MESH, jax.sharding.PartitionSpec("data", "tensor")
         )
-        lengths_sharding = jax.sharding.NamedSharding(
-            MESH, jax.sharding.PartitionSpec("data")
-        )
+        lengths_sharding = jax.sharding.NamedSharding(MESH, jax.sharding.PartitionSpec("data"))
 
         def apply_convolution(hidden, sequence_lengths):
             batch = SimpleNamespace(

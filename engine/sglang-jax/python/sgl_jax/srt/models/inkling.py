@@ -1,4 +1,5 @@
 import logging
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -28,6 +29,15 @@ from sgl_jax.srt.utils.weight_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+INKLING_SMALL_DSPARK_TARGET_LAYER_IDS = (1, 6, 12, 17, 23, 28, 34, 39)
+
+
+class InklingModelOutput(NamedTuple):
+    hidden_states: jax.Array
+    auxiliary_hidden_states: tuple[jax.Array, ...]
+    pool_updates: dict[str, object]
+    layers_topk_ids: list[jax.Array | None]
 
 
 def _text_config(config: PretrainedConfig) -> PretrainedConfig:
@@ -642,17 +652,15 @@ class InklingModel(nnx.Module):
             ]
         )
         self.norm = RMSNorm(config.hidden_size, epsilon=config.rms_norm_eps, param_dtype=dtype)
+        self.layers_to_capture: tuple[int, ...] = ()
 
     def __call__(
         self, forward_batch: ForwardBatch, memory_pools: MemoryPools
-    ) -> tuple[
-        jax.Array,
-        dict[str, object],
-        list[jax.Array | None],
-    ]:
+    ) -> InklingModelOutput:
         hidden_states = self.embed_norm(self.embed_tokens(forward_batch.input_ids))
         layers_kv_fused = []
         layers_topk_ids = []
+        auxiliary_hidden_states = []
         recurrent_state_pool = getattr(memory_pools, "recurrent_state_pool", None)
         conv_updates = None
         if recurrent_state_pool is not None:
@@ -671,6 +679,8 @@ class InklingModel(nnx.Module):
             )
             layers_kv_fused.append(kv_fused)
             layers_topk_ids.append(topk_ids)
+            if layer.layer_id in self.layers_to_capture:
+                auxiliary_hidden_states.append(hidden_states)
             if state_updates is not None:
                 conv_updates[layer_index] = state_updates
         pool_updates = {"token_to_kv_pool": layers_kv_fused}
@@ -679,7 +689,12 @@ class InklingModel(nnx.Module):
                 list(recurrent_state_pool.recurrent_buffers),
                 conv_updates,
             )
-        return self.norm(hidden_states), pool_updates, layers_topk_ids
+        return InklingModelOutput(
+            hidden_states=self.norm(hidden_states),
+            auxiliary_hidden_states=tuple(auxiliary_hidden_states),
+            pool_updates=pool_updates,
+            layers_topk_ids=layers_topk_ids,
+        )
 
 
 class InklingForCausalLM(nnx.Module):
@@ -709,20 +724,45 @@ class InklingForCausalLM(nnx.Module):
             mask_padded_vocab=True,
         )
 
+    def set_dspark_layers_to_capture(
+        self,
+        layer_ids: tuple[int, ...] | list[int] | None = None,
+    ) -> None:
+        selected = tuple(INKLING_SMALL_DSPARK_TARGET_LAYER_IDS if layer_ids is None else layer_ids)
+        if len(set(selected)) != len(selected):
+            raise ValueError(f"INKLING_DUPLICATE_CAPTURE_LAYERS layers={selected}")
+        invalid = [
+            layer_id
+            for layer_id in selected
+            if layer_id < 0 or layer_id >= self.text_config.num_hidden_layers
+        ]
+        if invalid:
+            raise ValueError(
+                "INKLING_CAPTURE_LAYER_OUT_OF_RANGE "
+                f"layers={invalid} num_layers={self.text_config.num_hidden_layers}"
+            )
+        self.model.layers_to_capture = selected
+
     def __call__(
         self,
         forward_batch: ForwardBatch,
         memory_pools: MemoryPools,
         logits_metadata: LogitsMetadata,
     ):
-        hidden_states, pool_updates, layers_topk_ids = self.model(forward_batch, memory_pools)
+        model_output = self.model(forward_batch, memory_pools)
+        hidden_states = model_output.hidden_states
         hidden_states = hidden_states / float(self.text_config.logits_mup_width_multiplier)
-        output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
+        output = self.logits_processor(
+            hidden_states,
+            self.lm_head,
+            logits_metadata,
+            aux_hidden_states=model_output.auxiliary_hidden_states,
+        )
         return (
             output,
-            pool_updates,
+            model_output.pool_updates,
             True,
-            layers_topk_ids,
+            model_output.layers_topk_ids,
         )
 
     def load_weights(self, model_config: ModelConfig) -> None:

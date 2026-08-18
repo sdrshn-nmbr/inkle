@@ -214,9 +214,9 @@ class FlashAttention(AttentionBackend):
         if batch.forward_mode == ForwardMode.TARGET_VERIFY:
             metadata.custom_mask = batch.spec_info_padded.custom_mask
             if metadata.custom_mask is not None:
-                assert (
-                    metadata.custom_mask.dtype != jnp.bool_
-                ), "custom_mask bool dtype is not supported; use int32 instead."
+                assert metadata.custom_mask.dtype != jnp.bool_, (
+                    "custom_mask bool dtype is not supported; use int32 instead."
+                )
         else:
             metadata.custom_mask = None
 
@@ -529,11 +529,7 @@ class FlashAttention(AttentionBackend):
         if self.forward_metadata.custom_mask is not None:
             causal = 0
         if (relative_states is None) != (relative_projection is None):
-            raise ValueError(
-                "relative_states and relative_projection must be provided together"
-            )
-        if relative_states is not None and forward_batch.forward_mode != ForwardMode.DECODE:
-            raise ValueError("Fused relative-position attention currently supports decode only")
+            raise ValueError("relative_states and relative_projection must be provided together")
         if hasattr(relative_projection, "value"):
             relative_projection = relative_projection.value
         # Select page indices and remap to SWA pool if KV cache supports it
@@ -671,7 +667,7 @@ class FlashAttention(AttentionBackend):
     def get_max_running_reqests(max_context_len: int, page_size: int) -> int:
         num_page_per_req = cdiv(max_context_len, page_size)
         res = 1024 * 1024 // 2 // num_page_per_req // 4
-        assert (
-            res > 0
-        ), f"max running requests: {res} must larger than 0, please increase page size or decrease max context length"
+        assert res > 0, (
+            f"max running requests: {res} must larger than 0, please increase page size or decrease max context length"
+        )
         return res

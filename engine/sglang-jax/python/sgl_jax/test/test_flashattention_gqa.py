@@ -7,6 +7,14 @@ from sgl_jax.test.flashattention_common import AttentionTestBase
 
 
 class TestFlashAttentionGQA(AttentionTestBase):
+    def test_gqa_candidate_block_with_relative_bias(self):
+        self.run_test(
+            "prefill",
+            [(3, 5), (4, 7)],
+            (32, 128, 8, 16, jnp.bfloat16, False),
+            relative_dim=16,
+        )
+
     def test_gqa_prefill_accuracy_page_size_64(self):
         """Test JAX attention accuracy against PyTorch reference"""
         # Parameters

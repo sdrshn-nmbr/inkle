@@ -14,22 +14,97 @@ from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention_v3 import
 
 
 class TestFusedRelativeAttention(unittest.TestCase):
-    def test_reference_adds_relative_bias_before_softmax(self):
+    def test_reference_verifies_candidate_block_with_distinct_query_biases(self):
+        query_length = 3
+        kv_length = 5
+        num_heads = 2
+        head_dim = 4
+        relative_dim = 3
         queries = (
-            jnp.arange(2 * 2 * 4, dtype=jnp.float32).reshape(2, 2, 4) / 17
+            jnp.arange(query_length * num_heads * head_dim, dtype=jnp.float32).reshape(
+                query_length, num_heads, head_dim
+            )
+            / 19
         ).astype(jnp.bfloat16)
         keys = (
-            jnp.arange(2 * 4 * 2 * 4, dtype=jnp.float32).reshape(2, 4, 2, 4) / 23
+            jnp.arange(kv_length * num_heads * head_dim, dtype=jnp.float32).reshape(
+                1, kv_length, num_heads, head_dim
+            )
+            / 23
         ).astype(jnp.bfloat16)
         values = (
-            jnp.arange(2 * 4 * 2 * 4, dtype=jnp.float32).reshape(2, 4, 2, 4) / 29
+            jnp.arange(kv_length * num_heads * head_dim, dtype=jnp.float32).reshape(
+                1, kv_length, num_heads, head_dim
+            )
+            / 29
         ).astype(jnp.bfloat16)
         relative_states = (
-            jnp.arange(2 * 2 * 3, dtype=jnp.float32).reshape(2, 2, 3) / 31
+            jnp.arange(query_length * num_heads * relative_dim, dtype=jnp.float32).reshape(
+                query_length, num_heads, relative_dim
+            )
+            / 31
         ).astype(jnp.bfloat16)
         relative_projection = (
-            jnp.arange(3 * 4, dtype=jnp.float32).reshape(3, 4) / 37
+            jnp.arange(relative_dim * 8, dtype=jnp.float32).reshape(relative_dim, 8) / 37
         ).astype(jnp.bfloat16)
+
+        actual = ref_ragged_paged_attention(
+            queries,
+            keys,
+            values,
+            jnp.asarray([kv_length], dtype=jnp.int32),
+            jnp.asarray([[0]], dtype=jnp.int32),
+            jnp.asarray([0, query_length], dtype=jnp.int32),
+            jnp.asarray([1], dtype=jnp.int32),
+            sm_scale=0.5,
+            relative_states=relative_states,
+            relative_projection=relative_projection,
+        )
+
+        query_positions = np.arange(kv_length - query_length, kv_length)
+        expected = []
+        for query_offset, query_position in enumerate(query_positions):
+            logits = (
+                np.einsum(
+                    "hd,khd->hk",
+                    np.asarray(queries[query_offset], dtype=np.float32),
+                    np.asarray(keys[0], dtype=np.float32),
+                )
+                * 0.5
+            )
+            distances = query_position - np.arange(kv_length)
+            valid = (distances >= 0) & (distances < relative_projection.shape[1])
+            selected = np.asarray(relative_projection, dtype=np.float32)[
+                :, np.clip(distances, 0, relative_projection.shape[1] - 1)
+            ]
+            bias = np.einsum(
+                "hd,dk->hk",
+                np.asarray(relative_states[query_offset], dtype=np.float32),
+                selected,
+            )
+            logits += np.where(valid[None, :], bias, 0.0)
+            logits[:, np.arange(kv_length) > query_position] = -np.inf
+            probabilities = jax.nn.softmax(jnp.asarray(logits), axis=-1)
+            expected.append(jnp.einsum("hk,khd->hd", probabilities, values[0]).astype(jnp.bfloat16))
+
+        np.testing.assert_allclose(actual, jnp.stack(expected), rtol=2e-2, atol=2e-2)
+
+    def test_reference_adds_relative_bias_before_softmax(self):
+        queries = (jnp.arange(2 * 2 * 4, dtype=jnp.float32).reshape(2, 2, 4) / 17).astype(
+            jnp.bfloat16
+        )
+        keys = (jnp.arange(2 * 4 * 2 * 4, dtype=jnp.float32).reshape(2, 4, 2, 4) / 23).astype(
+            jnp.bfloat16
+        )
+        values = (jnp.arange(2 * 4 * 2 * 4, dtype=jnp.float32).reshape(2, 4, 2, 4) / 29).astype(
+            jnp.bfloat16
+        )
+        relative_states = (jnp.arange(2 * 2 * 3, dtype=jnp.float32).reshape(2, 2, 3) / 31).astype(
+            jnp.bfloat16
+        )
+        relative_projection = (jnp.arange(3 * 4, dtype=jnp.float32).reshape(3, 4) / 37).astype(
+            jnp.bfloat16
+        )
         lengths = jnp.asarray([3, 2], dtype=jnp.int32)
 
         actual = ref_ragged_paged_attention(
@@ -50,12 +125,15 @@ class TestFusedRelativeAttention(unittest.TestCase):
             q = queries[sequence]
             k = keys[sequence, :length]
             v = values[sequence, :length]
-            logits = jnp.einsum(
-                "hd,khd->hk",
-                q,
-                k,
-                preferred_element_type=jnp.float32,
-            ) * 0.5
+            logits = (
+                jnp.einsum(
+                    "hd,khd->hk",
+                    q,
+                    k,
+                    preferred_element_type=jnp.float32,
+                )
+                * 0.5
+            )
             distances = length - 1 - jnp.arange(length)
             selected_projection = relative_projection[:, distances]
             bias = jnp.einsum(
@@ -83,9 +161,7 @@ class TestFusedRelativeAttention(unittest.TestCase):
 
         self.assertEqual(prepared_states.shape, (2, 2, 2, 128))
         self.assertEqual(prepared_projection.shape, (128, 261))
-        np.testing.assert_array_equal(
-            prepared_projection[:3, 128:133], projection[:, ::-1]
-        )
+        np.testing.assert_array_equal(prepared_projection[:3, 128:133], projection[:, ::-1])
         np.testing.assert_array_equal(prepared_projection[:3, :128], 0)
         np.testing.assert_array_equal(prepared_projection[:3, 133:], 0)
         np.testing.assert_array_equal(prepared_projection[3:], 0)
@@ -101,19 +177,11 @@ class TestFusedRelativeAttention(unittest.TestCase):
 
         for query_position in (0, 127, 1023, 1536, 4095):
             for key_start in range(0, query_position + 1, block_size):
-                projection_start = (
-                    work_len
-                    + extent
-                    - 1
-                    - query_position
-                    + key_start
-                )
+                projection_start = work_len + extent - 1 - query_position + key_start
                 aligned_projection_start = projection_start - projection_start % 128
                 projection_offset = projection_start - aligned_projection_start
                 window = projection[
-                    aligned_projection_start : aligned_projection_start
-                    + block_size
-                    + 128
+                    aligned_projection_start : aligned_projection_start + block_size + 128
                 ]
                 block = np.roll(
                     window,

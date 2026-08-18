@@ -349,7 +349,7 @@ def create_test_data(
 
         fb.attn_backend.forward_metadata.custom_mask = device_array(
             (fb.spec_info.custom_mask),
-            sharding=(NamedSharding(attention_backend.mesh, P())),
+            sharding=(NamedSharding(attention_backend.mesh, P("data"))),
         )
     return fb, current_kv_cache, q, k, v
 
@@ -375,6 +375,7 @@ class AttentionTestBase(CustomTestCase):
         logit_cap=None,
         xai_temperature_len=None,
         attention_sink=None,
+        relative_dim=None,
     ):
         # Create mock forward_batch
         if len(mode_args) == 5:
@@ -431,6 +432,19 @@ class AttentionTestBase(CustomTestCase):
             sliding_window_size=sliding_window or 0,
             logit_cap=logit_cap or 0,
         )
+        relative_states = None
+        relative_projection = None
+        if relative_dim is not None:
+            relative_states = jax.random.normal(
+                jax.random.key(61),
+                (q.shape[0], num_heads, relative_dim),
+                dtype=dtype,
+            )
+            relative_projection = jax.random.normal(
+                jax.random.key(62),
+                (relative_dim, 32),
+                dtype=dtype,
+            )
 
         padding_size = 4096
         cache_loc_list = []
@@ -457,9 +471,12 @@ class AttentionTestBase(CustomTestCase):
             q.reshape(q.shape[0], num_heads, head_dim),
             k.reshape(k.shape[0] // page_size, page_size, num_kv_heads, head_dim),
             v.reshape(v.shape[0] // page_size, page_size, num_kv_heads, head_dim),
-            forward_batch.seq_lens,
-            page_table,
-            forward_batch.attn_backend.forward_metadata.cu_q_lens,
+            jax.device_put(forward_batch.seq_lens, NamedSharding(mesh, P())),
+            jax.device_put(page_table, NamedSharding(mesh, P())),
+            jax.device_put(
+                forward_batch.attn_backend.forward_metadata.cu_q_lens,
+                NamedSharding(mesh, P()),
+            ),
             jnp.array([forward_batch.batch_size], dtype=jnp.int32),
             custom_mask=(
                 forward_batch.spec_info.custom_mask if forward_batch.spec_info is not None else None
@@ -470,6 +487,8 @@ class AttentionTestBase(CustomTestCase):
             soft_cap=logit_cap,
             xai_temperature_len=xai_temperature_len,
             attention_sink=attention_sink,
+            relative_states=relative_states,
+            relative_projection=relative_projection,
         )
         jax.block_until_ready(expected)
 
@@ -478,7 +497,16 @@ class AttentionTestBase(CustomTestCase):
 
         @jax.jit
         def jit_attn(q, k, v, forward_batch, token_to_kv_pool: KVCache):
-            out = attn(q, k, v, forward_batch, token_to_kv_pool, attention_sink=attention_sink)
+            out = attn(
+                q,
+                k,
+                v,
+                forward_batch,
+                token_to_kv_pool,
+                attention_sink=attention_sink,
+                relative_states=relative_states,
+                relative_projection=relative_projection,
+            )
             return out
 
         # run
