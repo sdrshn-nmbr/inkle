@@ -66,6 +66,10 @@ class NativeAttention(AttentionBackend):
         """Init the metadata for a forward pass and return it."""
         return FlashAttention.get_forward_metadata(self, batch)
 
+    def get_eagle_forward_metadata(self, batch: ModelWorkerBatch):
+        """Build metadata for linear multi-token target verification."""
+        return FlashAttention.get_eagle_forward_metadata(self, batch)
+
     @named_scope
     def __call__(
         self,
@@ -92,7 +96,10 @@ class NativeAttention(AttentionBackend):
 
         if (
             is_tpu_runtime()
-            and forward_batch.forward_mode == ForwardMode.DECODE
+            and (
+                forward_batch.forward_mode == ForwardMode.DECODE
+                or forward_batch.forward_mode.is_target_verify()
+            )
             and relative_states is not None
         ):
             return FlashAttention.__call__(
@@ -129,9 +136,18 @@ class NativeAttention(AttentionBackend):
         if attention_sink is not None and hasattr(attention_sink, "value"):
             attention_sink = attention_sink.value
 
+        seq_lens = forward_batch.seq_lens
+        extend_prefix_lens = forward_batch.extend_prefix_lens
+        extend_seq_lens = forward_batch.extend_seq_lens
+        if forward_batch.forward_mode.is_target_verify():
+            seq_lens = self.forward_metadata.seq_lens
+            verify_tokens = forward_batch.spec_info.draft_token_num
+            extend_seq_lens = jnp.where(seq_lens > 0, verify_tokens, 0).astype(jnp.int32)
+            extend_prefix_lens = seq_lens - extend_seq_lens
+
         cache_loc = compact_page_aligned_cache_loc(
             forward_batch.cache_loc,
-            forward_batch.seq_lens,
+            seq_lens,
             self.page_size,
             self.mesh,
         )
@@ -139,10 +155,10 @@ class NativeAttention(AttentionBackend):
             q,
             k_buffer,
             v_buffer,
-            forward_batch.seq_lens,
+            seq_lens,
             cache_loc,
-            forward_batch.extend_prefix_lens,
-            forward_batch.extend_seq_lens,
+            extend_prefix_lens,
+            extend_seq_lens,
             layer.q_head_num,
             layer.kv_head_num,
             scale,
@@ -372,7 +388,7 @@ def forward_attention(
         query_len = q_heads.shape[0]
 
         # Determine the sequence position of each query token
-        if mode == ForwardMode.EXTEND:
+        if mode.is_extend():
             q_starts = jnp.cumsum(extend_seq_lens, axis=0) - extend_seq_lens
             q_batch_indicators = jnp.zeros(query_len, dtype=jnp.int32).at[q_starts].set(1)
             q_batch_ids = jnp.cumsum(q_batch_indicators, axis=0) - 1
@@ -391,7 +407,7 @@ def forward_attention(
         attn_logits = attn_logits * regulator[:, None, None]
 
     # Apply appropriate masking
-    if mode == ForwardMode.EXTEND:
+    if mode.is_extend():
         attn_logits = _apply_extend_mask(
             attn_logits,
             seq_lengths,
@@ -464,10 +480,8 @@ def relative_position_bias(
         - key_starts[key_batch_ids]
     )
 
-    if mode == ForwardMode.EXTEND:
-        query_starts = (
-            jnp.cumsum(extend_seq_lens, axis=0, dtype=jnp.int32) - extend_seq_lens
-        )
+    if mode.is_extend():
+        query_starts = jnp.cumsum(extend_seq_lens, axis=0, dtype=jnp.int32) - extend_seq_lens
         query_markers = (
             jnp.zeros((query_len,), dtype=jnp.int32, out_sharding=metadata_sharding)
             .at[query_starts]
@@ -594,9 +608,7 @@ def _apply_decode_mask(
 
     def create_decode_sequence_mask():
         total_prefix_len = key_len
-        seq_starts = jnp.cumsum(
-            jnp.concatenate([jnp.array([0]), seq_lengths[:-1]]), axis=0
-        )
+        seq_starts = jnp.cumsum(jnp.concatenate([jnp.array([0]), seq_lengths[:-1]]), axis=0)
         seq_ends = seq_starts + seq_lengths
         all_positions = jnp.arange(total_prefix_len)
         seq_mask = (all_positions[None, :] >= seq_starts[:, None]) & (

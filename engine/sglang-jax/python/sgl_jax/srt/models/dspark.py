@@ -130,6 +130,15 @@ class DSparkDraftIntermediates(NamedTuple):
     final_hidden_states: jax.Array
 
 
+class DSparkLayerContext(NamedTuple):
+    key: jax.Array
+    value: jax.Array
+
+
+class DSparkContextCache(NamedTuple):
+    layers: tuple[DSparkLayerContext, ...]
+
+
 class DSparkAttention(nnx.Module):
     def __init__(
         self,
@@ -223,6 +232,116 @@ class DSparkAttention(nnx.Module):
             query_flat.reshape(batch_size, query_length, self.num_heads, self.head_dim),
             key_flat.reshape(batch_size, key_length, self.num_kv_heads, self.head_dim),
         )
+
+    def encode_context(
+        self,
+        target_hidden_states: jax.Array,
+        position_ids: jax.Array,
+    ) -> DSparkLayerContext:
+        batch_size, context_length, _ = target_hidden_states.shape
+        if position_ids.shape != (batch_size, context_length):
+            raise ValueError(
+                "DSpark context positions must match the cached context, "
+                f"expected {(batch_size, context_length)}, got {position_ids.shape}"
+            )
+        key, _ = self.k_proj(target_hidden_states)
+        value, _ = self.v_proj(target_hidden_states)
+        key = key.reshape(batch_size, context_length, self.num_kv_heads, self.head_dim)
+        value = value.reshape(batch_size, context_length, self.num_kv_heads, self.head_dim)
+        key = self.k_norm(key)
+        key_flat = key.reshape(batch_size * context_length, self.num_kv_heads, self.head_dim)
+        _, key_flat = self.rotary_emb(position_ids.reshape(-1), key_flat, key_flat)
+        return DSparkLayerContext(
+            key=key_flat.reshape(batch_size, context_length, self.num_kv_heads, self.head_dim),
+            value=value,
+        )
+
+    def apply_cached_context(
+        self,
+        hidden_states: jax.Array,
+        context: DSparkLayerContext,
+        draft_position_ids: jax.Array,
+        attention_mask: jax.Array | None,
+    ) -> jax.Array:
+        batch_size, query_length, _ = hidden_states.shape
+        context_length = context.key.shape[1]
+        key_length = context_length + query_length
+        if draft_position_ids.shape != (batch_size, query_length):
+            raise ValueError(
+                "DSpark draft positions must match the draft block, "
+                f"expected {(batch_size, query_length)}, got {draft_position_ids.shape}"
+            )
+        if attention_mask is not None and attention_mask.shape != (
+            batch_size,
+            query_length,
+            key_length,
+        ):
+            raise ValueError(
+                "DSpark cached attention mask must have shape "
+                "[batch, draft, context + draft], "
+                f"expected {(batch_size, query_length, key_length)}, "
+                f"got {attention_mask.shape}"
+            )
+
+        query, _ = self.q_proj(hidden_states)
+        draft_key, _ = self.k_proj(hidden_states)
+        draft_value, _ = self.v_proj(hidden_states)
+        query = query.reshape(batch_size, query_length, self.num_heads, self.head_dim)
+        draft_key = draft_key.reshape(batch_size, query_length, self.num_kv_heads, self.head_dim)
+        draft_value = draft_value.reshape(
+            batch_size, query_length, self.num_kv_heads, self.head_dim
+        )
+        query = self.q_norm(query)
+        draft_key = self.k_norm(draft_key)
+        query_flat = query.reshape(batch_size * query_length, self.num_heads, self.head_dim)
+        query_flat, _ = self.rotary_emb(draft_position_ids.reshape(-1), query_flat, query_flat)
+        key_flat = draft_key.reshape(batch_size * query_length, self.num_kv_heads, self.head_dim)
+        _, key_flat = self.rotary_emb(draft_position_ids.reshape(-1), key_flat, key_flat)
+        query = query_flat.reshape(batch_size, query_length, self.num_heads, self.head_dim)
+        draft_key = key_flat.reshape(batch_size, query_length, self.num_kv_heads, self.head_dim)
+        attention_sharding = NamedSharding(
+            self.mesh,
+            P("data", None, "tensor", None),
+        )
+        query = jax.sharding.reshard(query, attention_sharding)
+        draft_key = jax.sharding.reshard(draft_key, attention_sharding)
+        draft_value = jax.sharding.reshard(draft_value, attention_sharding)
+        context_key = jax.sharding.reshard(context.key, attention_sharding)
+        context_value = jax.sharding.reshard(context.value, attention_sharding)
+        key = jnp.concatenate((context_key, draft_key), axis=1)
+        value = jnp.concatenate((context_value, draft_value), axis=1)
+
+        key = jnp.repeat(
+            key,
+            self.num_key_value_groups,
+            axis=2,
+            out_sharding=attention_sharding,
+        )
+        value = jnp.repeat(
+            value,
+            self.num_key_value_groups,
+            axis=2,
+            out_sharding=attention_sharding,
+        )
+        scores = (
+            jnp.einsum(
+                "bqhd,bkhd->bhqk",
+                query,
+                key,
+                preferred_element_type=jnp.float32,
+            )
+            * self.scale
+        )
+        if attention_mask is not None:
+            scores = jnp.where(attention_mask[:, None, :, :], scores, -jnp.inf)
+        probabilities = jax.nn.softmax(scores.astype(jnp.float32), axis=-1).astype(value.dtype)
+        attended = jnp.einsum("bhqk,bkhd->bqhd", probabilities, value)
+        attended = attended.reshape(batch_size, query_length, self.num_heads * self.head_dim)
+        output, _ = self.o_proj(
+            attended,
+            out_sharding=NamedSharding(self.mesh, P("data", None, None)),
+        )
+        return output
 
     def __call__(
         self,
@@ -348,6 +467,30 @@ class DSparkDecoderLayer(nnx.Module):
             hidden_states,
             target_hidden_states,
             position_ids,
+            attention_mask,
+        )
+        hidden_states = residual + hidden_states
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(
+            hidden_states,
+            out_sharding=NamedSharding(self.self_attn.mesh, P("data", None, None)),
+        )
+        return residual + hidden_states
+
+    def apply_cached_context(
+        self,
+        hidden_states: jax.Array,
+        context: DSparkLayerContext,
+        draft_position_ids: jax.Array,
+        attention_mask: jax.Array | None,
+    ) -> jax.Array:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn.apply_cached_context(
+            hidden_states,
+            context,
+            draft_position_ids,
             attention_mask,
         )
         hidden_states = residual + hidden_states
@@ -526,6 +669,40 @@ class DSparkDraftModel(nnx.Module):
     def __call__(self, inputs: DSparkDraftInputs) -> jax.Array:
         return self.forward_with_intermediates(inputs).final_hidden_states
 
+    def encode_context(
+        self,
+        target_hidden_states: jax.Array,
+        position_ids: jax.Array,
+    ) -> DSparkContextCache:
+        projected = self.project_target_hidden(target_hidden_states)
+        return DSparkContextCache(
+            layers=tuple(
+                layer.self_attn.encode_context(projected, position_ids) for layer in self.layers
+            )
+        )
+
+    def forward_cached(
+        self,
+        noise_embeddings: jax.Array,
+        context: DSparkContextCache,
+        draft_position_ids: jax.Array,
+        attention_mask: jax.Array | None,
+    ) -> jax.Array:
+        if len(context.layers) != len(self.layers):
+            raise ValueError(
+                "DSpark context cache layer count does not match the draft model, "
+                f"expected {len(self.layers)}, got {len(context.layers)}"
+            )
+        hidden_states = noise_embeddings
+        for layer, layer_context in zip(self.layers, context.layers):
+            hidden_states = layer.apply_cached_context(
+                hidden_states,
+                layer_context,
+                draft_position_ids,
+                attention_mask,
+            )
+        return self.norm(hidden_states)
+
     def compute_base_logits(
         self,
         hidden_states: jax.Array,
@@ -555,6 +732,7 @@ class DSparkDraftModel(nnx.Module):
             scaled_hidden,
             target_lm_head,
             preferred_element_type=jnp.float32,
+            out_sharding=NamedSharding(self.mesh, P("data", None, "tensor")),
         )
         return logits[..., :target_vocab_size]
 

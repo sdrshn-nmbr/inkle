@@ -1668,7 +1668,7 @@ class ScheduleBatch:
         # prepare_for_decode requires cross-rank-flat allocate_lens
         # (asserts shape[0] == batch_size); rebuild via _concat, run it, then
         # split allocate_lens back to per-rank.
-        if self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
+        if self.spec_algorithm is not None and self.spec_algorithm.uses_eagle_scheduler():
             for info in self.reqs_info:
                 if not info.reqs:
                     info.input_ids = None
@@ -1841,6 +1841,7 @@ class ScheduleBatch:
                 info.token_ids_logprobs = None
                 info.sampling_info = None
                 info.spec_info = None
+                info.recurrent_indices = None
                 info.recurrent_cow_src_indices = None
                 continue
 
@@ -1869,6 +1870,14 @@ class ScheduleBatch:
 
             if info.output_ids is not None:
                 info.output_ids = info.output_ids[keep_indices_dp]
+
+            if info.recurrent_indices is not None:
+                info.recurrent_indices = info.recurrent_indices[keep_indices_dp]
+
+            if info.recurrent_cow_src_indices is not None:
+                info.recurrent_cow_src_indices = info.recurrent_cow_src_indices[
+                    keep_indices_dp
+                ]
 
             # Reset cache location (will be recomputed)
             info.out_cache_loc = None
@@ -2576,6 +2585,21 @@ class ScheduleBatch:
             logits_indices_selector,
         ) = self._merge_batch_metadata(per_dp_bs, total_bs)
         sampling_info = self._merge_sampling_info(per_dp_bs, total_bs)
+        recurrent_indices = None
+        if any(info.recurrent_indices is not None for info in self.reqs_info):
+            recurrent_indices = np.zeros(total_bs, dtype=np.int32)
+            for dp_rank, info in enumerate(self.reqs_info):
+                if info.recurrent_indices is None:
+                    continue
+                start = dp_rank * per_dp_bs
+                recurrent_indices[start : start + len(info.recurrent_indices)] = (
+                    info.recurrent_indices
+                )
+        has_initial_state = (
+            np.ones(total_bs, dtype=np.bool_)
+            if recurrent_indices is not None
+            else None
+        )
         for dp_rank, info in enumerate(self.reqs_info):
             spec_info_dp = info.spec_info
             future_indices = getattr(spec_info_dp, "future_indices", None)
@@ -2677,6 +2701,8 @@ class ScheduleBatch:
             spec_algorithm=self.spec_algorithm,
             tree_cache=self.tree_cache,
             mrope_positions=None,
+            recurrent_indices=recurrent_indices,
+            has_initial_state=has_initial_state,
         )
         return model_worker_batch
 
@@ -2751,7 +2777,7 @@ class ScheduleBatch:
         has_future_indices = getattr(flat, "future_indices", None) is not None
         if getattr(flat, "pending_draft_extend_result", None) is not None:
             flat.resolve_pending_draft_extend_result()
-        if not has_future_indices:
+        if not has_future_indices and getattr(flat, "requires_full_draft_state", True):
             flat._ensure_host()
             required_fields = ("topk_p", "topk_index", "hidden_states", "verified_id")
             missing = [f for f in required_fields if getattr(flat, f, None) is None]

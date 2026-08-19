@@ -37,7 +37,9 @@ def build_kv_cache(
         req_to_token_pool=req_to_token_pool,
         token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         page_size=page_size,
-        is_eagle=spec_algorithm is not None and spec_algorithm.is_eagle(),
+        is_eagle=(
+            spec_algorithm is not None and spec_algorithm.uses_eagle_scheduler()
+        ),
         sliding_window_size=sliding_window_size,
         enable_recurrent_extra_buffer=server_args.enable_recurrent_extra_buffer,
         recurrent_track_interval=server_args.recurrent_track_interval,

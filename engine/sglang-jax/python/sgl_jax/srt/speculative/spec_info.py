@@ -61,6 +61,7 @@ class SpeculativeAlgorithm(IntEnum):
     EAGLE3 = auto()
     NEXTN = auto()
     STANDALONE = auto()
+    DSPARK = auto()
 
     def is_none(self):
         return self == SpeculativeAlgorithm.NONE
@@ -81,6 +82,13 @@ class SpeculativeAlgorithm(IntEnum):
     def is_standalone(self):
         return self == SpeculativeAlgorithm.STANDALONE
 
+    def is_dspark(self):
+        return self == SpeculativeAlgorithm.DSPARK
+
+    def uses_eagle_scheduler(self):
+        """Whether the algorithm uses multi-token verify scheduler semantics."""
+        return self.is_eagle() or self.is_dspark()
+
     @staticmethod
     def from_string(name: str):
         name_map = {
@@ -88,6 +96,7 @@ class SpeculativeAlgorithm(IntEnum):
             "EAGLE3": SpeculativeAlgorithm.EAGLE3,
             "NEXTN": SpeculativeAlgorithm.NEXTN,
             "STANDALONE": SpeculativeAlgorithm.STANDALONE,
+            "DSPARK": SpeculativeAlgorithm.DSPARK,
             None: SpeculativeAlgorithm.NONE,
         }
         if name is not None:

@@ -204,6 +204,9 @@ class ServerArgs:
     speculative_num_draft_tokens: int = 4
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
+    speculative_dspark_block_size: int = 7
+    speculative_dspark_confidence_threshold: float | None = None
+    speculative_dspark_context_window: int = 256
 
     # For deterministic sampling
     enable_deterministic_sampling: bool = False
@@ -376,6 +379,28 @@ class ServerArgs:
         # Normalize speculative_algorithm: treat empty string as None
         if isinstance(self.speculative_algorithm, str) and self.speculative_algorithm.strip() == "":
             self.speculative_algorithm = None
+        if self.speculative_algorithm is not None:
+            self.speculative_algorithm = self.speculative_algorithm.upper()
+        if self.speculative_algorithm == "DSPARK":
+            if self.speculative_dspark_block_size <= 0:
+                raise ValueError(
+                    "--speculative-dspark-block-size must be positive, "
+                    f"got {self.speculative_dspark_block_size}."
+                )
+            if self.speculative_dspark_context_window <= 0:
+                raise ValueError(
+                    "--speculative-dspark-context-window must be positive, "
+                    f"got {self.speculative_dspark_context_window}."
+                )
+            threshold = self.speculative_dspark_confidence_threshold
+            if threshold is not None and not 0.0 < threshold <= 1.0:
+                raise ValueError(
+                    "--speculative-dspark-confidence-threshold must be in (0, 1], "
+                    f"got {threshold}."
+                )
+            self.speculative_num_steps = self.speculative_dspark_block_size
+            self.speculative_num_draft_tokens = self.speculative_dspark_block_size + 1
+            self.speculative_eagle_topk = 1
 
         # Recurrent extra-buffer static validation + track-interval
         # normalization. Gated on the flag so non-recurrent / base-path launches
@@ -1430,7 +1455,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE"],
+            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "DSPARK"],
             help="Speculative algorithm.",
             default=ServerArgs.speculative_algorithm,
         )
@@ -1454,6 +1479,28 @@ class ServerArgs:
             type=int,
             help="The number of steps sampled from draft model in Speculative Decoding.",
             default=ServerArgs.speculative_num_steps,
+        )
+        parser.add_argument(
+            "--speculative-dspark-block-size",
+            type=int,
+            default=ServerArgs.speculative_dspark_block_size,
+            help="Number of DSpark proposal tokens. The Inkling-Small checkpoint uses 7.",
+        )
+        parser.add_argument(
+            "--speculative-dspark-confidence-threshold",
+            type=float,
+            default=ServerArgs.speculative_dspark_confidence_threshold,
+            help=(
+                "Enable confidence-based DSpark chain shortening. The batch uses the "
+                "shortest prefix whose cumulative predicted acceptance remains above "
+                "this threshold. Omit for fixed-length verification."
+            ),
+        )
+        parser.add_argument(
+            "--speculative-dspark-context-window",
+            type=int,
+            default=ServerArgs.speculative_dspark_context_window,
+            help="Maximum number of target hidden states retained by the DSpark cache.",
         )
         parser.add_argument(
             "--speculative-eagle-topk",

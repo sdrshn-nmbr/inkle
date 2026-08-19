@@ -192,6 +192,45 @@ def test_small_draft_forward_and_heads() -> None:
     assert np.isfinite(np.asarray(proposal.corrected_logits)).all()
 
 
+def test_cached_context_matches_direct_forward() -> None:
+    model = build_dspark_draft_model(make_config(), MESH, dtype=jnp.float32)
+    batch_size = 2
+    context_length = 3
+    draft_length = 2
+    noise = jax.random.normal(
+        jax.random.key(11),
+        (batch_size, draft_length, model.config.hidden_size),
+    )
+    target = jax.random.normal(
+        jax.random.key(12),
+        (batch_size, context_length, model.config.context_width),
+    )
+    context_positions = jnp.broadcast_to(
+        jnp.arange(context_length), (batch_size, context_length)
+    )
+    draft_positions = jnp.broadcast_to(
+        jnp.arange(context_length, context_length + draft_length),
+        (batch_size, draft_length),
+    )
+    mask = jnp.ones(
+        (batch_size, draft_length, context_length + draft_length),
+        dtype=jnp.bool_,
+    )
+
+    direct = model(
+        DSparkDraftInputs(
+            noise_embeddings=noise,
+            target_hidden_states=target,
+            position_ids=jnp.concatenate((context_positions, draft_positions), axis=1),
+            attention_mask=mask,
+        )
+    )
+    context = model.encode_context(target, context_positions)
+    cached = model.forward_cached(noise, context, draft_positions, mask)
+
+    np.testing.assert_allclose(np.asarray(cached), np.asarray(direct), rtol=1e-5, atol=1e-5)
+
+
 def test_config_rejects_unsupported_draft_layer() -> None:
     config = make_config()
     config.layer_types = ["full_attention", "sliding_attention"]

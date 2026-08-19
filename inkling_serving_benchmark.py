@@ -60,7 +60,7 @@ def stream_request(
         f"{url}/generate",
         json=request_body,
         stream=True,
-        timeout=300,
+        timeout=900,
     ) as response:
         response.raise_for_status()
         for line in response.iter_lines():
@@ -83,6 +83,7 @@ def stream_request(
         for previous, current in zip(arrival_ms, arrival_ms[1:], strict=False)
     ]
     return {
+        "completion_token_deltas": completion_token_deltas(chunks),
         "chunks": chunks,
         "e2e_ms": (end_ns - start_ns) / 1e6,
         "inter_token_ms": inter_token_ms,
@@ -173,7 +174,7 @@ def run_batch_group(
         f"{url}/generate",
         json=request_body,
         stream=True,
-        timeout=300,
+        timeout=900,
     ) as response:
         response.raise_for_status()
         for line in response.iter_lines():
@@ -193,6 +194,7 @@ def run_batch_group(
         arrival_ms = [chunk["elapsed_ms"] for chunk in chunks]
         requests_out.append(
             {
+                "completion_token_deltas": completion_token_deltas(chunks),
                 "chunks": chunks,
                 "e2e_ms": (end_ns - start_ns) / 1e6,
                 "inter_token_ms": [
@@ -236,22 +238,44 @@ def summarize(groups: list[dict[str, object]]) -> dict[str, object]:
             for request in group["requests"]
             for value in request["inter_token_ms"]
         ]
-        full_batch_metrics = [fully_active_metrics(group) for group in selected]
+        full_batch_metrics = []
+        for group in selected:
+            try:
+                full_batch_metrics.append(fully_active_metrics(group))
+            except ValueError:
+                pass
+        accepted_per_step = [
+            delta
+            for group in selected
+            for request in group["requests"]
+            for delta in request["completion_token_deltas"]
+        ]
         output_signatures = [output_multiset_signature(group) for group in selected]
         slot_output_signatures = [slot_output_signature(group) for group in selected]
         by_concurrency[str(concurrency)] = {
             "e2e_median_ms": statistics.median(e2e),
             "e2e_p95_ms": sorted(e2e)[max(0, int(len(e2e) * 0.95) - 1)],
             "inter_token_median_ms": statistics.median(itl) if itl else None,
+            "accepted_tokens_per_stream_step_mean": (
+                statistics.mean(accepted_per_step) if accepted_per_step else None
+            ),
             "throughput_median_tokens_per_second": statistics.median(
                 group["throughput_tokens_per_second"] for group in selected
             ),
             "time_to_first_token_median_ms": statistics.median(ttft) if ttft else None,
-            "fully_active_model_step_median_ms": statistics.median(
-                metrics["model_step_median_ms"] for metrics in full_batch_metrics
+            "fully_active_model_step_median_ms": (
+                statistics.median(
+                    metrics["model_step_median_ms"] for metrics in full_batch_metrics
+                )
+                if full_batch_metrics
+                else None
             ),
-            "fully_active_throughput_median_tokens_per_second": statistics.median(
-                metrics["throughput_tokens_per_second"] for metrics in full_batch_metrics
+            "fully_active_throughput_median_tokens_per_second": (
+                statistics.median(
+                    metrics["throughput_tokens_per_second"] for metrics in full_batch_metrics
+                )
+                if full_batch_metrics
+                else None
             ),
             "output_multiset_stable": len(set(output_signatures)) == 1,
             "slot_output_mapping_stable": len(set(slot_output_signatures)) == 1,
@@ -283,9 +307,14 @@ def fully_active_metrics(group: dict[str, object]) -> dict[str, float]:
         raise ValueError("No interval exists with every request decoding")
 
     token_count = sum(
-        start_ms <= chunk["elapsed_ms"] < end_ms
+        delta
         for request in requests_out
-        for chunk in request["chunks"]
+        for chunk, delta in zip(
+            request["chunks"],
+            request["completion_token_deltas"],
+            strict=True,
+        )
+        if start_ms <= chunk["elapsed_ms"] < end_ms
     )
     model_steps = [
         request["inter_token_ms"][index]
@@ -298,6 +327,17 @@ def fully_active_metrics(group: dict[str, object]) -> dict[str, float]:
         "model_step_median_ms": statistics.median(model_steps),
         "throughput_tokens_per_second": token_count * 1000 / (end_ms - start_ms),
     }
+
+
+def completion_token_deltas(chunks: list[dict[str, object]]) -> list[int]:
+    cumulative = [
+        int(chunk["response"]["meta_info"]["completion_tokens"])
+        for chunk in chunks
+    ]
+    return [
+        current - previous
+        for previous, current in zip([0, *cumulative[:-1]], cumulative, strict=True)
+    ]
 
 
 def output_multiset_signature(group: dict[str, object]) -> tuple[str, ...]:
@@ -369,6 +409,13 @@ def main() -> None:
             )
             group["repetition"] = repetition
             groups.append(group)
+            checkpoint = {
+                "groups": groups,
+                "summary": summarize(groups),
+            }
+            (args.output_directory / "serving-benchmark.partial.json").write_text(
+                json.dumps(checkpoint, indent=2, sort_keys=True)
+            )
             print(
                 json.dumps(
                     {

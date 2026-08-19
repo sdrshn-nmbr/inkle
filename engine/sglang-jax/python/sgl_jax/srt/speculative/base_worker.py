@@ -351,8 +351,8 @@ class BaseSpecWorker:
             # but the last req at bs>1). Redirect -1 to each req's own last slot.
             # accept_index has length bs*(spec_steps+1); the gathered tensors have
             # length bs*draft_token_num — equal at topk=1, distinct at topk>1.
-            draft_n = self.speculative_num_draft_tokens
-            accept_width = self.speculative_num_steps + 1
+            draft_n = spec_info.draft_token_num
+            accept_width = spec_info.spec_steps + 1
             req_ids = np.arange(len(accept_index)) // accept_width
             per_req_last = req_ids * draft_n + draft_n - 1
             safe_index = np.where(accept_index >= 0, accept_index, per_req_last)
@@ -385,4 +385,5 @@ class BaseSpecWorker:
             cache_miss_count=cache_miss_count,
             extend_input_len_per_req=None,
             extend_logprob_start_len_per_req=None,
+            speculative_draft_token_num=spec_info.draft_token_num,
         )

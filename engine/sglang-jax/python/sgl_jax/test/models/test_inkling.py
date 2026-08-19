@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
@@ -166,8 +167,61 @@ class TestInklingLayout(unittest.TestCase):
 
         self.assertEqual(result.shape, (5, 2, 5))
 
+    def test_target_verify_relative_bias_uses_multi_token_extend_positions(self):
+        relative = jnp.arange(3 * 2 * 2, dtype=jnp.float32).reshape(3, 2, 2)
+        projection = jnp.arange(2 * 8, dtype=jnp.float32).reshape(2, 8) / 10
+        arguments = (
+            relative,
+            projection,
+            jnp.asarray([5], dtype=jnp.int32),
+            jnp.asarray([2], dtype=jnp.int32),
+            jnp.asarray([3], dtype=jnp.int32),
+        )
+
+        verify = relative_position_bias(
+            *arguments,
+            ForwardMode.TARGET_VERIFY,
+            5,
+            MESH,
+        )
+        extend = relative_position_bias(
+            *arguments,
+            ForwardMode.EXTEND,
+            5,
+            MESH,
+        )
+
+        np.testing.assert_array_equal(np.asarray(verify), np.asarray(extend))
+
 
 class TestInklingModel(unittest.TestCase):
+    def test_target_verify_uses_fused_relative_attention_on_tpu(self):
+        attention = NativeAttention(4, 2, 128, MESH)
+        expected = object()
+        with (
+            patch(
+                "sgl_jax.srt.layers.attention.native_backend.is_tpu_runtime",
+                return_value=True,
+            ),
+            patch(
+                "sgl_jax.srt.layers.attention.native_backend.FlashAttention.__call__",
+                return_value=expected,
+            ) as fused_attention,
+        ):
+            actual = attention(
+                jnp.zeros((8, 4, 8), dtype=jnp.bfloat16),
+                jnp.zeros((8, 2, 8), dtype=jnp.bfloat16),
+                jnp.zeros((8, 2, 8), dtype=jnp.bfloat16),
+                SimpleNamespace(),
+                SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY),
+                object(),
+                relative_states=jnp.zeros((8, 4, 4), dtype=jnp.bfloat16),
+                relative_projection=jnp.zeros((4, 16), dtype=jnp.bfloat16),
+            )
+
+        self.assertIs(actual, expected)
+        fused_attention.assert_called_once()
+
     def test_dspark_capture_returns_exact_post_layer_states(self):
         class AddLayer(nnx.Module):
             def __init__(self, layer_id: int):

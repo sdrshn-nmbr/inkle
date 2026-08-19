@@ -220,6 +220,21 @@ def test_filter_batch_preserves_global_spec_info(dp, bs_per_rank, finish):
         flat_base += bs
 
 
+def test_filter_batch_filters_recurrent_slots_with_requests():
+    sb = _mk_batch(1, [7])
+    info = sb.reqs_info[0]
+    info.recurrent_indices = np.arange(101, 108, dtype=np.int32)
+    info.recurrent_cow_src_indices = np.arange(201, 208, dtype=np.int32)
+
+    sb.filter_batch(keep_indices={0: [0, 2, 4, 6]})
+
+    np.testing.assert_array_equal(info.recurrent_indices, [101, 103, 105, 107])
+    np.testing.assert_array_equal(
+        info.recurrent_cow_src_indices,
+        [201, 203, 205, 207],
+    )
+
+
 def test_filter_batch_then_decode_mwb_round_trip():
     """Regression for 2-req partial-finish → next-round decode mwb (r9 crash).
 

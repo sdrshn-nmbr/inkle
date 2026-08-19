@@ -211,7 +211,7 @@ class InklingShortConvolution(nnx.Module):
             activation=None,
             x_window_sharding=NamedSharding(self.mesh, P("data", None, "tensor")),
             cache_window_sharding=NamedSharding(self.mesh, P("data", "tensor", None)),
-            backend="pallas",
+            backend=(None if forward_batch.forward_mode.is_target_verify() else "pallas"),
         )
         new_state_table = None
         if state_table is not None:
@@ -1072,6 +1072,9 @@ class InklingForCausalLM(nnx.Module):
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.embedding.value, self.lm_head.embedding.value
+
+    def get_embed_and_head_modules(self):
+        return self.model.embed_tokens, self.lm_head
 
 
 class InklingForConditionalGeneration(InklingForCausalLM):

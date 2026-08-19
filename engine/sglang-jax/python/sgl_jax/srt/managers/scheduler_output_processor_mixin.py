@@ -342,10 +342,15 @@ class SchedulerOutputProcessorMixin:
                 resolve_spec_decode_token_ids,
             )
 
+            draft_token_num = (
+                result.speculative_draft_token_num
+                if result.speculative_draft_token_num is not None
+                else self.draft_worker.speculative_num_draft_tokens
+            )
             next_token_ids, accept_lens = resolve_spec_decode_token_ids(
                 result,
                 batch,
-                self.draft_worker.speculative_num_draft_tokens,
+                draft_token_num,
             )
             if self.enable_overlap and launch_done is not None:
                 launch_done.wait()
@@ -443,9 +448,14 @@ class SchedulerOutputProcessorMixin:
                 new_accepted_len = 1
                 if not is_spec_decode:
                     req.output_ids.append(next_token_id)
-                elif self.spec_algorithm.is_eagle():
-                    req.output_ids.extend([int(t) for t in next_token_id])
-                    new_accepted_len = len(next_token_id)
+                elif self.spec_algorithm.uses_eagle_scheduler():
+                    remaining = max(
+                        req.sampling_params.max_new_tokens - len(req.output_ids),
+                        0,
+                    )
+                    accepted_tokens = [int(t) for t in next_token_id[:remaining]]
+                    req.output_ids.extend(accepted_tokens)
+                    new_accepted_len = len(accepted_tokens)
 
                 req.check_finished(new_accepted_len)
 
@@ -456,7 +466,7 @@ class SchedulerOutputProcessorMixin:
                             len(req.output_ids) - 1, 0
                         )
                         req.kv_committed_len = actual_token_len
-                    elif is_spec_decode and self.spec_algorithm.is_eagle():
+                    elif is_spec_decode and self.spec_algorithm.uses_eagle_scheduler():
                         # prepare_for_decode pre-claims one bonus slot. Keep
                         # kv_allocated_len as the allocation upper bound and let
                         # release_kv_cache free the overallocated tail.
@@ -484,7 +494,7 @@ class SchedulerOutputProcessorMixin:
                     )
                 elif (
                     is_spec_decode
-                    and self.spec_algorithm.is_eagle()
+                    and self.spec_algorithm.uses_eagle_scheduler()
                     and not legacy_eagle3_non_overlap
                 ):
                     req.kv_committed_len += new_accepted_len - 1
@@ -844,9 +854,7 @@ class SchedulerOutputProcessorMixin:
                     )
                 request_state_slots.extend([req.request_pool_slot] * state_slot_count)
                 recurrent_state_slot = (
-                    req.recurrent_state_slot
-                    if req.recurrent_state_slot is not None
-                    else None
+                    req.recurrent_state_slot if req.recurrent_state_slot is not None else None
                 )
                 recurrent_state_slots.extend([recurrent_state_slot] * state_slot_count)
                 finished_reasons.append(

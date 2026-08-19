@@ -4,6 +4,7 @@ from inkling_serving_benchmark import (
     request_recurrent_state_slot,
     request_state_slot,
     slot_output_signature,
+    summarize,
 )
 
 
@@ -69,3 +70,27 @@ def test_slot_output_signature_follows_internal_slot_not_submission_order() -> N
     assert slot_output_signature({"requests": [first, second]}) == slot_output_signature(
         {"requests": [second, first]}
     )
+
+
+def test_summary_keeps_group_without_fully_active_interval() -> None:
+    requests = []
+    for slot, elapsed_ms in enumerate((10.0, 20.0)):
+        request = make_request(slot, f"output-{slot}")
+        request.update(
+            e2e_ms=elapsed_ms,
+            time_to_first_token_ms=elapsed_ms,
+            inter_token_ms=[],
+            completion_token_deltas=[1],
+        )
+        request["chunks"][0]["elapsed_ms"] = elapsed_ms
+        requests.append(request)
+    group = {
+        "concurrency": 2,
+        "requests": requests,
+        "throughput_tokens_per_second": 100.0,
+    }
+
+    result = summarize([group])["2"]
+
+    assert result["fully_active_model_step_median_ms"] is None
+    assert result["fully_active_throughput_median_tokens_per_second"] is None

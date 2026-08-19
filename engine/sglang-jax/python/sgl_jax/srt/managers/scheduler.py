@@ -89,6 +89,7 @@ from sgl_jax.srt.multimodal.tokenizer_utils import resolve_tokenizer_subdir
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+from sgl_jax.srt.speculative.dspark_worker import DSparkWorker
 from sgl_jax.srt.speculative.overlap_utils import (
     can_use_spec_decode_overlap,
     can_use_spec_prefill_overlap,
@@ -144,6 +145,7 @@ class GenerationBatchResult:
 
     num_accepted_tokens: int | None = None
     accept_lens: np.ndarray | None = None
+    speculative_draft_token_num: int | None = None
 
 
 class Scheduler(
@@ -372,6 +374,11 @@ class Scheduler(
             )
             if self.enable_overlap and hasattr(self.draft_worker, "init_spec_relay_buffers"):
                 self.draft_worker.init_spec_relay_buffers()
+        elif self.spec_algorithm is not None and self.spec_algorithm.is_dspark():
+            self.draft_worker = DSparkWorker(
+                server_args=server_args,
+                target_worker=self.tp_worker,
+            )
 
         # Get token and memory info from the model worker
         (
@@ -2327,7 +2334,7 @@ class Scheduler(
                 batch_output.next_token_ids
                 if (
                     self.spec_algorithm is not None
-                    and self.spec_algorithm.is_eagle()
+                    and self.spec_algorithm.uses_eagle_scheduler()
                     and (batch.forward_mode.is_decode() or defer_spec_prefill_output)
                     and self.enable_overlap
                 )
@@ -2339,10 +2346,16 @@ class Scheduler(
             cache_miss_count=cache_miss_count,
             spec_relay_buffers=spec_relay_buffers,
             prefill_relay_future_indices=prefill_relay_future_indices,
+            speculative_draft_token_num=(
+                batch_output.speculative_draft_token_num
+                if self.spec_algorithm is not None
+                and not self.spec_algorithm.is_none()
+                else None
+            ),
         )
         if (
             self.spec_algorithm is not None
-            and self.spec_algorithm.is_eagle()
+            and self.spec_algorithm.uses_eagle_scheduler()
             and batch_output.next_draft_input is not None
         ):
             assert isinstance(batch_output.next_draft_input, EagleDraftInput)
