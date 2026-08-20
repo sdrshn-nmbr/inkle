@@ -98,6 +98,62 @@ def get_last_loc_jax_array(
     )
 
 
+def verify_compact_chain_greedy(
+    dense_candidates: np.ndarray,
+    compact_target_predict: np.ndarray,
+    verify_lens: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    candidates = np.asarray(dense_candidates, dtype=np.int32)
+    target_predict = np.asarray(compact_target_predict, dtype=np.int32)
+    lengths = np.asarray(verify_lens, dtype=np.int32)
+    if candidates.ndim != 2 or lengths.shape != (candidates.shape[0],):
+        raise ValueError(
+            "DSPARK_COMPACT_VERIFY_SHAPE_MISMATCH "
+            f"candidates={candidates.shape} verify_lens={lengths.shape}"
+        )
+    if np.any((lengths < 0) | (lengths > candidates.shape[1])) or not np.any(
+        lengths > 0
+    ):
+        raise ValueError(
+            f"DSPARK_COMPACT_VERIFY_LENGTH_INVALID verify_lens={lengths.tolist()}"
+        )
+    offsets = np.concatenate(
+        (np.zeros(1, dtype=np.int32), np.cumsum(lengths, dtype=np.int32))
+    )
+    if target_predict.shape != (int(offsets[-1]),):
+        raise ValueError(
+            "DSPARK_COMPACT_PREDICT_SHAPE_MISMATCH "
+            f"predictions={target_predict.shape} expected={(int(offsets[-1]),)}"
+        )
+    batch_size, maximum = candidates.shape
+    predict = np.zeros((batch_size, maximum), dtype=np.int32)
+    accept_index = np.full((batch_size, maximum), -1, dtype=np.int32)
+    accept_length = np.zeros(batch_size, dtype=np.int32)
+    verified_id = np.zeros_like(accept_index)
+    for row, verify_len in enumerate(lengths):
+        if verify_len == 0:
+            continue
+        row_predict = target_predict[offsets[row] : offsets[row + 1]]
+        matched = 0
+        for step in range(1, int(verify_len)):
+            if candidates[row, step] != row_predict[step - 1]:
+                break
+            matched += 1
+        accepted = matched + 1
+        accept_length[row] = accepted
+        predict[row, :accepted] = row_predict[:accepted]
+        verified_id[row, :accepted] = row_predict[:accepted]
+        accept_index[row, :accepted] = offsets[row] + np.arange(
+            accepted, dtype=np.int32
+        )
+    return (
+        predict.reshape(-1),
+        verified_id.reshape(-1),
+        accept_length,
+        accept_index.reshape(-1),
+    )
+
+
 def get_last_loc_large_page_size_top_k_1(
     req_to_token: jax.Array,
     req_pool_indices: jax.Array,

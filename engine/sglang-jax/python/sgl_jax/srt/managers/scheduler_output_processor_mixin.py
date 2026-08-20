@@ -767,6 +767,7 @@ class SchedulerOutputProcessorMixin:
         rids = []
         request_state_slots = []
         recurrent_state_slots = []
+        server_batch_sizes = []
         finished_reasons: list[BaseFinishReason] = []
 
         decoded_texts = []
@@ -857,6 +858,7 @@ class SchedulerOutputProcessorMixin:
                     req.recurrent_state_slot if req.recurrent_state_slot is not None else None
                 )
                 recurrent_state_slots.extend([recurrent_state_slot] * state_slot_count)
+                server_batch_sizes.extend([len(reqs)] * state_slot_count)
                 finished_reasons.append(
                     req.finished_reason.to_json() if req.finished_reason else None
                 )
@@ -978,6 +980,7 @@ class SchedulerOutputProcessorMixin:
                 output_hidden_states_for_mm,
                 cache_miss_count,
                 output_routed_experts,
+                server_batch_sizes,
             )
             if self._comm_backend is not None:
                 self._comm_backend.send_pyobj(out)

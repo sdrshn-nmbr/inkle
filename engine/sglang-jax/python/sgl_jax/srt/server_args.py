@@ -10,6 +10,7 @@ import tempfile
 
 import jax
 
+from sgl_jax.srt.configs.dspark import validate_inkling_small_dspark_target
 from sgl_jax.srt.function_call.function_call_parser import FunctionCallParser
 from sgl_jax.srt.hf_transformers_utils import (
     check_gguf_file,
@@ -207,6 +208,8 @@ class ServerArgs:
     speculative_dspark_block_size: int = 7
     speculative_dspark_confidence_threshold: float | None = None
     speculative_dspark_context_window: int = 256
+    speculative_dspark_sps_table_path: str | None = None
+    speculative_dspark_sts_path: str | None = None
 
     # For deterministic sampling
     enable_deterministic_sampling: bool = False
@@ -382,6 +385,17 @@ class ServerArgs:
         if self.speculative_algorithm is not None:
             self.speculative_algorithm = self.speculative_algorithm.upper()
         if self.speculative_algorithm == "DSPARK":
+            validate_inkling_small_dspark_target(
+                self.model_path,
+                self.revision,
+                self.tokenizer_path,
+            )
+            if not self.disable_radix_cache:
+                raise ValueError(
+                    "DSPARK_PREFIX_CACHE_UNSUPPORTED pass --disable-radix-cache; "
+                    "the draft context cache does not restore target hidden states "
+                    "for reused prefixes"
+                )
             if self.speculative_dspark_block_size <= 0:
                 raise ValueError(
                     "--speculative-dspark-block-size must be positive, "
@@ -397,6 +411,24 @@ class ServerArgs:
                 raise ValueError(
                     "--speculative-dspark-confidence-threshold must be in (0, 1], "
                     f"got {threshold}."
+                )
+            if threshold is not None and self.speculative_dspark_sps_table_path is not None:
+                raise ValueError(
+                    "DSPARK_PLANNER_MODE_CONFLICT choose either a fixed confidence "
+                    "threshold or an SPS cost table"
+                )
+            if (
+                self.speculative_dspark_sps_table_path is not None
+                and self.speculative_dspark_sts_path is None
+            ):
+                raise ValueError(
+                    "DSPARK_STS_REQUIRED an SPS planner requires calibrated confidence"
+                )
+            if self.speculative_dspark_sts_path is not None and (
+                threshold is None and self.speculative_dspark_sps_table_path is None
+            ):
+                raise ValueError(
+                    "DSPARK_STS_UNUSED provide a confidence threshold or SPS cost table"
                 )
             self.speculative_num_steps = self.speculative_dspark_block_size
             self.speculative_num_draft_tokens = self.speculative_dspark_block_size + 1
@@ -1501,6 +1533,18 @@ class ServerArgs:
             type=int,
             default=ServerArgs.speculative_dspark_context_window,
             help="Maximum number of target hidden states retained by the DSpark cache.",
+        )
+        parser.add_argument(
+            "--speculative-dspark-sps-table-path",
+            type=str,
+            default=ServerArgs.speculative_dspark_sps_table_path,
+            help="Measured target verification step-rate table for DSpark planning.",
+        )
+        parser.add_argument(
+            "--speculative-dspark-sts-path",
+            type=str,
+            default=ServerArgs.speculative_dspark_sts_path,
+            help="Per-proposal confidence temperatures fitted for this target checkpoint.",
         )
         parser.add_argument(
             "--speculative-eagle-topk",

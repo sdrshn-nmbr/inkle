@@ -473,6 +473,71 @@ class ShortConvolutionTest(CustomTestCase):
 
         kernel.assert_called_once()
 
+    @unittest.skipUnless(jax.default_backend() == "tpu", "requires TPU Pallas")
+    def test_pallas_matches_variable_length_target_verification(self):
+        mesh = jax.sharding.Mesh(
+            np.asarray(jax.devices()).reshape((1, -1)),
+            ("data", "tensor"),
+        )
+        lengths = np.asarray([4, 0, 1, 0, 3], dtype=np.int32)
+        cumulative = jnp.asarray(
+            np.concatenate(([0], np.cumsum(lengths))),
+            dtype=jnp.int32,
+        )
+        hidden = 4096
+        kernel_size = 4
+        x = jax.device_put(
+            jnp.asarray(
+                self.rng.standard_normal((int(lengths.sum()), hidden)),
+                dtype=jnp.float32,
+            ),
+            NamedSharding(mesh, P("data", "tensor")),
+        )
+        weight = jax.device_put(
+            _make_weight(self.rng, hidden, kernel_size, jnp.float32),
+            NamedSharding(mesh, P("tensor", None)),
+        )
+        cache = jax.device_put(
+            jnp.asarray(
+                self.rng.standard_normal((lengths.size, hidden, kernel_size - 1)),
+                dtype=jnp.float32,
+            ),
+            NamedSharding(mesh, P("data", "tensor", None)),
+        )
+        kwargs = {
+            "bias": None,
+            "activation": None,
+            "x_window_sharding": NamedSharding(mesh, P("data", None, "tensor")),
+            "cache_window_sharding": NamedSharding(mesh, P("data", "tensor", None)),
+        }
+
+        expected_output, expected_cache = short_convolution(
+            x,
+            weight,
+            cache,
+            cumulative,
+            ForwardMode.TARGET_VERIFY,
+            bias=None,
+            activation=None,
+            backend=None,
+        )
+        actual_output, actual_cache = short_convolution(
+            x,
+            weight,
+            cache,
+            cumulative,
+            ForwardMode.TARGET_VERIFY,
+            backend="pallas",
+            **kwargs,
+        )
+
+        np.testing.assert_allclose(
+            np.asarray(actual_output), np.asarray(expected_output), rtol=1e-5, atol=1e-5
+        )
+        np.testing.assert_allclose(
+            np.asarray(actual_cache), np.asarray(expected_cache), rtol=1e-5, atol=1e-5
+        )
+
 
 class ShortConvolutionBF16Test(ShortConvolutionTest):
     """Same suite as ShortConvolutionTest but with bf16 inputs/weights.

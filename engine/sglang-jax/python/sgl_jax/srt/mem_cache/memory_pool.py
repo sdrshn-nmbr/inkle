@@ -110,6 +110,7 @@ class ReqToTokenPool:
 
         # Create sharded request to token mapping table
         self.req_to_token = np.zeros((size, max_context_len), dtype=dtype)
+        self.slot_generations = np.zeros(size, dtype=np.int64)
 
         # Use simple list to manage free slots
         self.free_slots = list(range(size))
@@ -132,6 +133,7 @@ class ReqToTokenPool:
             "max_context_len": self.max_context_len,
             "dtype": self.dtype,
             "free_slots": self.free_slots,
+            "slot_generations": self.slot_generations,
         }
         return (children, aux_data)
 
@@ -143,6 +145,7 @@ class ReqToTokenPool:
         obj.max_context_len = aux_data["max_context_len"]
         obj.dtype = aux_data["dtype"]
         obj.free_slots = aux_data["free_slots"]
+        obj.slot_generations = aux_data["slot_generations"]
 
         obj.req_to_token = children[0]
         # Host scratch buffer is transient host memory, not model state, so it
@@ -189,6 +192,7 @@ class ReqToTokenPool:
             if r.req_pool_idx is None:
                 r.req_pool_idx = select_indices[offset]
                 r.request_pool_slot = int(r.req_pool_idx)
+                self.slot_generations[r.req_pool_idx] += 1
                 offset += 1
         return [r.req_pool_idx for r in reqs]
 
@@ -201,6 +205,7 @@ class ReqToTokenPool:
     def clear(self):
         """Clear all allocation states"""
         self.free_slots = list(range(self.size))
+        self.slot_generations += 1
 
 
 class HybridReqToTokenPool(ReqToTokenPool):

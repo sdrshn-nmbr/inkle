@@ -141,8 +141,14 @@ class NativeAttention(AttentionBackend):
         extend_seq_lens = forward_batch.extend_seq_lens
         if forward_batch.forward_mode.is_target_verify():
             seq_lens = self.forward_metadata.seq_lens
-            verify_tokens = forward_batch.spec_info.draft_token_num
-            extend_seq_lens = jnp.where(seq_lens > 0, verify_tokens, 0).astype(jnp.int32)
+            verify_lens = getattr(forward_batch.spec_info, "verify_lens", None)
+            if verify_lens is None:
+                verify_tokens = forward_batch.spec_info.draft_token_num
+                extend_seq_lens = jnp.where(seq_lens > 0, verify_tokens, 0).astype(
+                    jnp.int32
+                )
+            else:
+                extend_seq_lens = jnp.asarray(verify_lens, dtype=jnp.int32)
             extend_prefix_lens = seq_lens - extend_seq_lens
 
         cache_loc = compact_page_aligned_cache_loc(

@@ -7,6 +7,31 @@ from typing import Any
 
 INKLING_SMALL_DSPARK_REPO = "RadixArk/Inkling-Small-DSpark"
 INKLING_SMALL_DSPARK_REVISION = "736501c3901cfc6bbb53ba382781eb0e5d9ad66a"
+INKLING_SMALL_NVFP4_REPO = "thinkingmachines/Inkling-Small-NVFP4"
+INKLING_SMALL_NVFP4_REVISION = "b6a99534467840620d411e4cd4ad5819b2610d9c"
+
+
+def validate_inkling_small_dspark_target(
+    model_path: str,
+    revision: str | None,
+    tokenizer_path: str | None,
+) -> None:
+    if model_path != INKLING_SMALL_NVFP4_REPO:
+        raise ValueError(
+            "DSPARK_TARGET_MODEL_MISMATCH "
+            f"expected={INKLING_SMALL_NVFP4_REPO} got={model_path}"
+        )
+    if revision != INKLING_SMALL_NVFP4_REVISION:
+        raise ValueError(
+            "DSPARK_TARGET_REVISION_MISMATCH "
+            f"expected={INKLING_SMALL_NVFP4_REVISION} got={revision}"
+        )
+    resolved_tokenizer = tokenizer_path or model_path
+    if resolved_tokenizer != INKLING_SMALL_NVFP4_REPO:
+        raise ValueError(
+            "DSPARK_TARGET_TOKENIZER_MISMATCH "
+            f"expected={INKLING_SMALL_NVFP4_REPO} got={resolved_tokenizer}"
+        )
 
 
 def _positive_int(config: Any, name: str) -> int:

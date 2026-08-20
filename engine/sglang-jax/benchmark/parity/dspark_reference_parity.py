@@ -11,6 +11,7 @@ import numpy as np
 import torch
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
+from transformers import DynamicCache
 
 from dspark import DSparkDraftModel as TorchDSparkDraftModel
 from sgl_jax.srt.configs.model_config import ModelConfig
@@ -106,6 +107,131 @@ def _jax_outputs(
     return outputs, model
 
 
+def _torch_proposal(
+    model: TorchDSparkDraftModel,
+    hidden_states: torch.Tensor,
+    base_logits: torch.Tensor,
+    anchor_token_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    previous = anchor_token_ids
+    token_rows = []
+    logit_rows = []
+    confidence_rows = []
+    for step in range(hidden_states.shape[1]):
+        previous_embedding = model.markov_head.get_prev_embeddings(previous)
+        corrected = base_logits[:, step] + model.markov_head.project_bias(
+            previous_embedding
+        )
+        token_ids = torch.argmax(corrected, dim=-1)
+        confidence = model.confidence_head(
+            torch.cat((hidden_states[:, step], previous_embedding), dim=-1)
+        )
+        token_rows.append(token_ids)
+        logit_rows.append(corrected)
+        confidence_rows.append(confidence)
+        previous = token_ids
+    return (
+        torch.stack(token_rows, dim=1),
+        torch.stack(logit_rows, dim=1),
+        torch.stack(confidence_rows, dim=1),
+    )
+
+
+def _multi_round_results(
+    torch_model: TorchDSparkDraftModel,
+    jax_model: DSparkDraftModel,
+    *,
+    rng: np.random.Generator,
+    context_width: int,
+    accepted_lengths: list[int],
+) -> dict[str, dict[str, float] | dict[str, bool]]:
+    gamma = int(jax_model.config.block_size)
+    hidden_size = int(jax_model.config.hidden_size)
+    vocab_size = int(jax_model.config.vocab_size)
+    torch_cache = DynamicCache()
+    jax_history = np.zeros((1, 0, context_width), dtype=np.float32)
+    results: dict[str, dict[str, float] | dict[str, bool]] = {}
+    for round_index, accepted_length in enumerate(accepted_lengths):
+        new_context_length = 2 if round_index == 0 else accepted_lengths[round_index - 1]
+        new_target = rng.standard_normal(
+            (1, new_context_length, context_width), dtype=np.float32
+        )
+        noise = rng.standard_normal((1, gamma, hidden_size), dtype=np.float32)
+        previous_context_length = jax_history.shape[1]
+        total_context_length = previous_context_length + new_context_length
+        torch_positions = np.arange(
+            previous_context_length,
+            total_context_length + gamma,
+            dtype=np.int64,
+        )[None, :]
+        with torch.inference_mode():
+            torch_hidden = torch_model(
+                position_ids=torch.from_numpy(torch_positions),
+                noise_embedding=torch.from_numpy(noise),
+                target_hidden=torch.from_numpy(new_target),
+                past_key_values=torch_cache,
+                use_cache=True,
+                is_causal=False,
+            )
+        torch_cache.crop(total_context_length)
+
+        jax_history = np.concatenate((jax_history, new_target), axis=1)
+        context = jax_model.encode_context(
+            jnp.asarray(jax_history),
+            jnp.arange(total_context_length, dtype=jnp.int32)[None, :],
+        )
+        jax_hidden = jax_model.forward_cached(
+            jnp.asarray(noise),
+            context,
+            jnp.arange(
+                total_context_length,
+                total_context_length + gamma,
+                dtype=jnp.int32,
+            )[None, :],
+            jnp.ones((1, gamma, total_context_length + gamma), dtype=jnp.bool_),
+        )
+        hidden_metrics = _metrics(
+            torch_hidden.detach().cpu().numpy(), np.asarray(jax_hidden)
+        )
+
+        base_logits = np.zeros((1, gamma, vocab_size), dtype=np.float32)
+        anchor = np.asarray([17 + round_index], dtype=np.int32)
+        with torch.inference_mode():
+            torch_tokens, torch_logits, torch_confidence = _torch_proposal(
+                torch_model,
+                torch_hidden,
+                torch.from_numpy(base_logits),
+                torch.from_numpy(anchor),
+            )
+        jax_proposal = jax_model.greedy_propose(
+            jnp.asarray(base_logits),
+            jax_hidden,
+            jnp.asarray(anchor),
+        )
+        results[f"round_{round_index}_hidden"] = hidden_metrics
+        results[f"round_{round_index}_corrected_logits"] = _metrics(
+            torch_logits.detach().cpu().numpy(),
+            np.asarray(jax_proposal.corrected_logits),
+        )
+        results[f"round_{round_index}_confidence"] = _metrics(
+            torch_confidence.detach().cpu().numpy(),
+            np.asarray(jax_proposal.confidence_logits),
+        )
+        results[f"round_{round_index}_tokens"] = {
+            "exact": bool(
+                np.array_equal(
+                    torch_tokens.detach().cpu().numpy(),
+                    np.asarray(jax_proposal.token_ids),
+                )
+            )
+        }
+        if not 1 <= accepted_length <= gamma + 1:
+            raise ValueError(
+                f"accepted length must be in [1, {gamma + 1}], got {accepted_length}"
+            )
+    return results
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Compare the pinned Torch and JAX Inkling-Small DSpark models."
@@ -115,6 +241,13 @@ def main() -> None:
     parser.add_argument("--context-length", type=int, default=1)
     parser.add_argument("--draft-length", type=int, default=2)
     parser.add_argument("--minimum-cosine", type=float, default=0.9999)
+    parser.add_argument(
+        "--round-accept-lengths",
+        type=int,
+        nargs="+",
+        default=[8, 1, 4],
+        help="Accepted target-input prefixes used to exercise full and partial cache crops.",
+    )
     args = parser.parse_args()
 
     config = ModelConfig(str(args.checkpoint), dtype="float32").hf_config
@@ -178,12 +311,26 @@ def main() -> None:
     results["confidence"] = _metrics(
         torch_confidence.numpy(), np.asarray(jax_confidence)
     )
+    results.update(
+        _multi_round_results(
+            torch_model,
+            jax_model,
+            rng=rng,
+            context_width=len(config.dflash_config["target_layer_ids"])
+            * config.hidden_size,
+            accepted_lengths=args.round_accept_lengths,
+        )
+    )
 
     print(json.dumps(results, indent=2, sort_keys=True))
     failures = {
         name: metrics
         for name, metrics in results.items()
-        if metrics["cosine"] < args.minimum_cosine
+        if (
+            "cosine" in metrics
+            and metrics["cosine"] < args.minimum_cosine
+        )
+        or ("exact" in metrics and not metrics["exact"])
     }
     if failures:
         raise SystemExit(f"DSpark parity failed: {sorted(failures)}")

@@ -3,6 +3,7 @@
 import contextlib
 import dataclasses
 import logging
+import os
 from functools import partial
 
 import jax
@@ -640,6 +641,12 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 pool_updates = [jax.device_put(kv, target_sharding) for kv in pool_updates]
             self.memory_pools.replace_all(pool_updates)
             output.recurrent_state_transaction = recurrent_state_transaction
+
+        if os.getenv("SGL_JAX_DSPARK_DIAGNOSTIC_DIR"):
+            num_layers = self.model_config.num_hidden_layers
+            output.diagnostic_layers_topk_ids = layers_topk_ids[:num_layers]
+            output.diagnostic_component_states = layers_topk_ids[num_layers:]
+            layers_topk_ids = layers_topk_ids[:num_layers]
 
         # layers_topk_ids required real_bs and original_input_len which could not be stored in ForwardBatch
         return output, cache_miss_count, layers_topk_ids

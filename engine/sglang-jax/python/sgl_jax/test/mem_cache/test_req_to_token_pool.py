@@ -69,6 +69,26 @@ class TestReqToTokenPoolAlloc(CustomTestCase):
         self.assertEqual(fresh_b.req_pool_idx, 2)
         self.assertEqual(self.pool.free_slots, [3])
 
+    def test_slot_generation_changes_only_for_a_new_request(self):
+        req = FakeReq()
+        self.pool.alloc([req])
+        slot = req.req_pool_idx
+        first_generation = self.pool.slot_generations[slot]
+
+        req.is_chunked = 1
+        req.kv_committed_len = 1
+        self.pool.alloc([req])
+        self.assertEqual(self.pool.slot_generations[slot], first_generation)
+
+        self.pool.free(req)
+        self.pool.free_slots.remove(slot)
+        self.pool.free_slots.insert(0, slot)
+        replacement = FakeReq()
+        self.pool.alloc([replacement])
+
+        self.assertEqual(replacement.req_pool_idx, slot)
+        self.assertEqual(self.pool.slot_generations[slot], first_generation + 1)
+
     def test_alloc_atomic_with_partial_reuse(self):
         retained = FakeReq(req_pool_idx=5, is_chunked=1)  # outside [0, size); ok for the test
         # Only one fresh slot left, but two fresh reqs requested -> overflow.

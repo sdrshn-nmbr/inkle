@@ -225,7 +225,12 @@ class FlashAttention(AttentionBackend):
         if batch.forward_mode.is_target_verify():
             padded_batch_size = len(batch.seq_lens)
             extend_seq_lens = np.zeros(padded_batch_size, dtype=np.int32)
-            extend_seq_lens[batch.logits_indices_selector] = batch.spec_info_padded.draft_token_num
+            verify_lens = getattr(batch.spec_info_padded, "verify_lens", None)
+            extend_seq_lens[batch.logits_indices_selector] = (
+                batch.spec_info_padded.draft_token_num
+                if verify_lens is None
+                else np.asarray(verify_lens, dtype=np.int32)[batch.logits_indices_selector]
+            )
         else:
             extend_seq_lens = batch.extend_seq_lens
         cu_q_lens = _per_dp_cumsum(extend_seq_lens, dp_size, per_dp_bs)

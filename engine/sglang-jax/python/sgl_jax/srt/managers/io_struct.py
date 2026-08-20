@@ -89,6 +89,9 @@ class BatchStrOut:
     # The routed experts for each output token
     output_routed_experts: list[str | None] = None
 
+    # Number of real requests in the scheduler batch that produced each output
+    server_batch_sizes: list[int] = None
+
 
 @dataclass
 class BatchTokenIDOut:
@@ -138,6 +141,9 @@ class BatchTokenIDOut:
 
     # The routed experts for each output token
     output_routed_experts: list[np.ndarray] = None
+
+    # Number of real requests in the scheduler batch that produced each output
+    server_batch_sizes: list[int] = None
 
 
 @dataclass

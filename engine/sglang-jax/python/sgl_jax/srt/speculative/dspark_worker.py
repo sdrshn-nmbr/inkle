@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
+from functools import partial
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import jax
@@ -21,10 +24,17 @@ from sgl_jax.srt.models.dspark import (
     DSparkLayerContext,
 )
 from sgl_jax.srt.speculative.base_worker import BaseDraftWorker, BaseSpecWorker
+from sgl_jax.srt.speculative.dspark_verify import DSparkVerifyInput, DSparkVerifyLayout
+from sgl_jax.srt.speculative.dspark_planner import (
+    DSparkScheduleConfig,
+    compute_verify_token_budget,
+    confidence_to_survival,
+    load_sps_cost_table,
+    load_sts_temperatures,
+    schedule_verify_lengths,
+)
 from sgl_jax.srt.speculative.eagle_util import (
     EagleDraftInput,
-    EagleVerifyInput,
-    build_chain_verify_inputs_device,
 )
 
 logger = logging.getLogger(__name__)
@@ -65,10 +75,18 @@ class DSparkDraftInput(EagleDraftInput):
             raise TypeError(
                 f"DSPARK_STATE_TYPE_MISMATCH expected=DSparkDraftInput got={type(other).__name__}"
             )
+        for field in ("verified_id", "allocate_lens"):
+            left = getattr(self, field, None)
+            right = getattr(other, field, None)
+            if left is None or right is None:
+                raise ValueError(f"DSPARK_REQUIRED_STATE_MISSING field={field}")
+            setattr(
+                self,
+                field,
+                np.concatenate((np.asarray(left), np.asarray(right))),
+            )
         for field in (
             "hidden_states",
-            "verified_id",
-            "allocate_lens",
             "new_seq_lens",
             "accept_length",
             "accept_length_cpu",
@@ -79,12 +97,13 @@ class DSparkDraftInput(EagleDraftInput):
             if left is None and right is None:
                 continue
             if left is None or right is None:
-                raise ValueError(f"DSPARK_STATE_FIELD_MISMATCH field={field}")
-            setattr(
-                self,
-                field,
-                np.concatenate((np.asarray(left), np.asarray(right))),
-            )
+                setattr(self, field, None)
+            else:
+                setattr(
+                    self,
+                    field,
+                    np.concatenate((np.asarray(left), np.asarray(right))),
+                )
 
 
 @dataclass(frozen=True)
@@ -94,12 +113,28 @@ class DSparkChainDecision:
     confidence: np.ndarray
 
 
+@dataclass(frozen=True)
+class PendingDSparkConfidence:
+    logits: jax.Array
+    request_indices: np.ndarray
+    slot_generations: np.ndarray
+
+
 def choose_confidence_chain_length(
     confidence_logits: jax.Array | np.ndarray,
     *,
     threshold: float | None,
+    temperatures: np.ndarray | None = None,
 ) -> DSparkChainDecision:
     logits = np.asarray(jax.device_get(confidence_logits), dtype=np.float32)
+    if temperatures is not None:
+        values = np.asarray(temperatures, dtype=np.float32)
+        if values.shape != (logits.shape[1],):
+            raise ValueError(
+                "DSPARK_STS_TEMPERATURE_SHAPE_MISMATCH "
+                f"temperatures={values.shape} logits={logits.shape}"
+            )
+        logits = logits / values[None, :]
     confidence = 1.0 / (1.0 + np.exp(-logits))
     maximum = logits.shape[1] + 1
     if threshold is None:
@@ -169,6 +204,64 @@ def compact_dspark_verified_ids(
     return verified[selector, selected_accept - 1]
 
 
+def build_dspark_verify_input(
+    *,
+    anchor: np.ndarray,
+    proposal_ids: np.ndarray,
+    prefix_lens: np.ndarray,
+    selector: np.ndarray,
+    real_verify_lens: np.ndarray,
+    maximum_verify_tokens: int,
+    seq_lens_sum: int,
+) -> DSparkVerifyInput:
+    anchors = np.asarray(anchor, dtype=np.int32)
+    proposals = np.asarray(proposal_ids, dtype=np.int32)
+    prefixes = np.asarray(prefix_lens, dtype=np.int32)
+    real_rows = np.asarray(selector, dtype=np.int32)
+    requested_lens = np.asarray(real_verify_lens, dtype=np.int32)
+    batch_size = anchors.size
+    expected_proposals = (batch_size, maximum_verify_tokens - 1)
+    if proposals.shape != expected_proposals:
+        raise ValueError(
+            "DSPARK_PROPOSAL_LAYOUT_MISMATCH "
+            f"proposals={proposals.shape} expected={expected_proposals}"
+        )
+    if prefixes.shape != (batch_size,) or requested_lens.shape != (real_rows.size,):
+        raise ValueError(
+            "DSPARK_VERIFY_REQUEST_LAYOUT_MISMATCH "
+            f"prefixes={prefixes.shape} selector={real_rows.shape} "
+            f"verify_lens={requested_lens.shape}"
+        )
+
+    dense_tokens = np.concatenate((anchors[:, None], proposals), axis=1)
+    dense_positions = prefixes[:, None] + np.arange(
+        maximum_verify_tokens, dtype=np.int32
+    )[None, :]
+    verify_lens = np.zeros(batch_size, dtype=np.int32)
+    verify_lens[real_rows] = requested_lens
+    row_indices = np.repeat(np.arange(batch_size, dtype=np.int32), verify_lens)
+    column_indices = np.concatenate(
+        [np.arange(length, dtype=np.int32) for length in verify_lens]
+    )
+    return DSparkVerifyInput(
+        verify_ids_strided=jnp.asarray(dense_tokens, dtype=jnp.int32),
+        compact_input_ids=jnp.asarray(
+            dense_tokens[row_indices, column_indices], dtype=jnp.int32
+        ),
+        compact_positions=jnp.asarray(
+            dense_positions[row_indices, column_indices], dtype=jnp.int32
+        ),
+        layout=DSparkVerifyLayout.from_verify_lens(
+            verify_lens,
+            maximum_verify_tokens=maximum_verify_tokens,
+        ),
+        capture_hidden_mode=CaptureHiddenMode.FULL,
+        seq_lens_sum=seq_lens_sum,
+        seq_lens_cpu=prefixes,
+        max_verify_tokens=maximum_verify_tokens,
+    )
+
+
 @nnx.jit
 def _encode_context(
     model: DSparkDraftModel,
@@ -176,6 +269,60 @@ def _encode_context(
     position_ids: jax.Array,
 ) -> DSparkContextCache:
     return model.encode_context(target_hidden_states, position_ids)
+
+
+@partial(jax.jit, static_argnames=("cache_row_sharding",))
+def _write_context_rows(
+    context_key: tuple[jax.Array, ...],
+    context_value: tuple[jax.Array, ...],
+    encoded: DSparkContextCache,
+    request_indices: jax.Array,
+    ring_positions: jax.Array,
+    *,
+    cache_row_sharding: NamedSharding,
+) -> tuple[tuple[jax.Array, ...], tuple[jax.Array, ...]]:
+    key_updates = tuple(
+        jax.sharding.reshard(layer.key[:, 0], cache_row_sharding)
+        for layer in encoded.layers
+    )
+    value_updates = tuple(
+        jax.sharding.reshard(layer.value[:, 0], cache_row_sharding)
+        for layer in encoded.layers
+    )
+    return (
+        tuple(
+            cache.at[request_indices, ring_positions].set(rows)
+            for cache, rows in zip(context_key, key_updates, strict=True)
+        ),
+        tuple(
+            cache.at[request_indices, ring_positions].set(rows)
+            for cache, rows in zip(context_value, value_updates, strict=True)
+        ),
+    )
+
+
+@partial(jax.jit, static_argnames=("context_sharding",))
+def _gather_context_rows(
+    context_key: tuple[jax.Array, ...],
+    context_value: tuple[jax.Array, ...],
+    request_indices: jax.Array,
+    positions: jax.Array,
+    *,
+    context_sharding: NamedSharding,
+) -> DSparkContextCache:
+    return DSparkContextCache(
+        layers=tuple(
+            DSparkLayerContext(
+                key=key.at[request_indices, positions].get(
+                    out_sharding=context_sharding
+                ),
+                value=value.at[request_indices, positions].get(
+                    out_sharding=context_sharding
+                ),
+            )
+            for key, value in zip(context_key, context_value, strict=True)
+        )
+    )
 
 
 @nnx.jit(
@@ -222,6 +369,19 @@ class DSparkDraftWorker(BaseDraftWorker):
         self.maximum_verify_tokens = self.gamma + 1
         self.context_window = int(server_args.speculative_dspark_context_window)
         self.confidence_threshold = server_args.speculative_dspark_confidence_threshold
+        self.sps_table = (
+            None
+            if server_args.speculative_dspark_sps_table_path is None
+            else load_sps_cost_table(server_args.speculative_dspark_sps_table_path)
+        )
+        self.sts_temperatures = (
+            None
+            if server_args.speculative_dspark_sts_path is None
+            else load_sts_temperatures(
+                server_args.speculative_dspark_sts_path,
+                gamma=self.gamma,
+            )
+        )
         EagleDraftInput.ALLOC_LEN_PER_DECODE = self.maximum_verify_tokens
 
         target_model = target_worker.model_runner.model
@@ -284,6 +444,11 @@ class DSparkDraftWorker(BaseDraftWorker):
         self.accepted_tokens = 0
         self.verified_requests = 0
         self.last_decision: DSparkChainDecision | None = None
+        self.confidence_logits_by_slot = np.zeros(
+            (req_pool_size, self.gamma), dtype=np.float32
+        )
+        self.confidence_generations = np.full(req_pool_size, -1, dtype=np.int64)
+        self.pending_confidence: PendingDSparkConfidence | None = None
         logger.info(
             "DSPARK_READY gamma=%d verify_tokens=%d context_window=%d confidence_threshold=%s",
             self.gamma,
@@ -295,6 +460,44 @@ class DSparkDraftWorker(BaseDraftWorker):
     @property
     def draft_model_runner(self):
         return self._draft_model_runner
+
+    def _resolve_pending_confidence(self) -> None:
+        pending = self.pending_confidence
+        if pending is None:
+            return
+        values = np.asarray(jax.device_get(pending.logits), dtype=np.float32)
+        if values.shape != (pending.request_indices.size, self.gamma):
+            raise ValueError(
+                "DSPARK_CONFIDENCE_RELAY_SHAPE_MISMATCH "
+                f"values={values.shape} requests={pending.request_indices.size} "
+                f"gamma={self.gamma}"
+            )
+        self.confidence_logits_by_slot[pending.request_indices] = values
+        self.confidence_generations[pending.request_indices] = pending.slot_generations
+        self.pending_confidence = None
+
+    def _lagged_confidence_logits(
+        self,
+        request_indices: np.ndarray,
+        slot_generations: np.ndarray,
+    ) -> np.ndarray:
+        valid = self.confidence_generations[request_indices] == slot_generations
+        logits = np.full((request_indices.size, self.gamma), 20.0, dtype=np.float32)
+        logits[valid] = self.confidence_logits_by_slot[request_indices[valid]]
+        return logits
+
+    def _publish_confidence(
+        self,
+        logits: jax.Array,
+        request_indices: np.ndarray,
+        slot_generations: np.ndarray,
+    ) -> None:
+        logits.copy_to_host_async()
+        self.pending_confidence = PendingDSparkConfidence(
+            logits=logits,
+            request_indices=request_indices.copy(),
+            slot_generations=slot_generations.copy(),
+        )
 
     def _append_hidden(
         self,
@@ -317,27 +520,14 @@ class DSparkDraftWorker(BaseDraftWorker):
         request_indices_device = jnp.asarray(request_indices, dtype=jnp.int32)
         ring_positions = jnp.asarray(positions % self.context_window, dtype=jnp.int32)
         cache_row_sharding = NamedSharding(self.mesh, P(None, "tensor", None))
-        for layer_id, layer_context in enumerate(encoded.layers):
-            key_rows = jax.sharding.reshard(layer_context.key[:, 0], cache_row_sharding)
-            value_rows = jax.sharding.reshard(layer_context.value[:, 0], cache_row_sharding)
-            self.context_key = (
-                self.context_key[:layer_id]
-                + (
-                    self.context_key[layer_id]
-                    .at[request_indices_device, ring_positions]
-                    .set(key_rows),
-                )
-                + self.context_key[layer_id + 1 :]
-            )
-            self.context_value = (
-                self.context_value[:layer_id]
-                + (
-                    self.context_value[layer_id]
-                    .at[request_indices_device, ring_positions]
-                    .set(value_rows),
-                )
-                + self.context_value[layer_id + 1 :]
-            )
+        self.context_key, self.context_value = _write_context_rows(
+            self.context_key,
+            self.context_value,
+            encoded,
+            request_indices_device,
+            ring_positions,
+            cache_row_sharding=cache_row_sharding,
+        )
 
     def _append_prefill_hidden(
         self,
@@ -382,14 +572,12 @@ class DSparkDraftWorker(BaseDraftWorker):
         req = jnp.asarray(request_indices, dtype=jnp.int32)[:, None]
         pos = jnp.asarray(safe_positions, dtype=jnp.int32)
         context_sharding = NamedSharding(self.mesh, P("data", None, "tensor", None))
-        context = DSparkContextCache(
-            layers=tuple(
-                DSparkLayerContext(
-                    key=jax.sharding.reshard(key[req, pos], context_sharding),
-                    value=jax.sharding.reshard(value[req, pos], context_sharding),
-                )
-                for key, value in zip(self.context_key, self.context_value)
-            )
+        context = _gather_context_rows(
+            self.context_key,
+            self.context_value,
+            req,
+            pos,
+            context_sharding=context_sharding,
         )
         return (
             context,
@@ -473,64 +661,88 @@ class DSparkDraftWorker(BaseDraftWorker):
         )
 
         real_bs = int(model_worker_batch.real_bs)
-        confidence_logits = np.asarray(
-            jax.device_get(proposal.confidence_logits),
-            dtype=np.float32,
-        )[:real_bs]
-        decision = choose_confidence_chain_length(
-            confidence_logits,
-            threshold=self.confidence_threshold,
-        )
-        num_verify_tokens = decision.verify_tokens
-        anchor_device = jax.sharding.reshard(
-            jnp.asarray(anchor, dtype=jnp.int32),
-            NamedSharding(self.mesh, P()),
-        )
-        proposal_ids = jax.sharding.reshard(
-            proposal.token_ids,
-            NamedSharding(self.mesh, P()),
-        )
-        verified_seq_lens_device = jax.sharding.reshard(
-            jnp.asarray(verified_seq_lens, dtype=jnp.int32),
-            NamedSharding(self.mesh, P()),
-        )
-        packed = build_chain_verify_inputs_device(
-            anchor_device,
-            proposal_ids,
-            verified_seq_lens_device,
-            num_verify_tokens,
-            batch_size,
-        )
-        packed = jax.device_put(packed, NamedSharding(self.mesh, P()))
-        model_worker_batch.spec_info_padded = EagleVerifyInput(
-            draft_token=packed[0],
-            custom_mask=None,
-            positions=packed[1],
-            retrive_index=packed[2].reshape(batch_size, num_verify_tokens),
-            retrive_next_token=packed[3].reshape(batch_size, num_verify_tokens),
-            retrive_next_sibling=packed[4].reshape(batch_size, num_verify_tokens),
-            retrive_cum_len=None,
-            spec_steps=num_verify_tokens - 1,
-            topk=1,
-            draft_token_num=num_verify_tokens,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
+        selector = np.asarray(model_worker_batch.logits_indices_selector, dtype=np.int32)
+        adaptive_verify = self.confidence_threshold is not None or self.sps_table is not None
+        if adaptive_verify:
+            req_to_token_pool, _ = self.target_worker.get_memory_pool()
+            real_request_indices = request_indices[selector]
+            slot_generations = np.asarray(
+                req_to_token_pool.slot_generations[real_request_indices], dtype=np.int64
+            )
+            self._resolve_pending_confidence()
+            confidence_logits = self._lagged_confidence_logits(
+                real_request_indices,
+                slot_generations,
+            )
+            decision = choose_confidence_chain_length(
+                confidence_logits,
+                threshold=self.confidence_threshold,
+                temperatures=self.sts_temperatures,
+            )
+            current_confidence = proposal.confidence_logits[selector]
+            self._publish_confidence(
+                current_confidence,
+                real_request_indices,
+                slot_generations,
+            )
+        else:
+            fixed_verify_tokens = self.maximum_verify_tokens
+            decision = DSparkChainDecision(
+                verify_tokens=fixed_verify_tokens,
+                per_request_verify_tokens=np.full(
+                    real_bs,
+                    fixed_verify_tokens,
+                    dtype=np.int32,
+                ),
+                confidence=np.empty((real_bs, 0), dtype=np.float32),
+            )
+        if self.sps_table is not None:
+            survival = confidence_to_survival(decision.confidence)
+            schedule_config = DSparkScheduleConfig(gamma=self.gamma)
+            budget = compute_verify_token_budget(
+                survival,
+                self.sps_table,
+                schedule_config,
+            ).budget
+            per_request_verify_tokens = schedule_verify_lengths(
+                survival,
+                budget,
+                schedule_config,
+            )
+            decision = DSparkChainDecision(
+                verify_tokens=int(np.min(per_request_verify_tokens)),
+                per_request_verify_tokens=per_request_verify_tokens,
+                confidence=decision.confidence,
+            )
+        maximum_verify_tokens = self.maximum_verify_tokens
+        proposal_ids_host = np.asarray(jax.device_get(proposal.token_ids), dtype=np.int32)
+        model_worker_batch.spec_info_padded = build_dspark_verify_input(
+            anchor=anchor,
+            proposal_ids=proposal_ids_host,
+            prefix_lens=verified_seq_lens,
+            selector=selector,
+            real_verify_lens=decision.per_request_verify_tokens,
+            maximum_verify_tokens=maximum_verify_tokens,
             seq_lens_sum=model_worker_batch.seq_lens_sum,
-            seq_lens_cpu=seq_lens,
         )
         self.rounds += 1
         self.proposed_tokens += real_bs * self.gamma
-        self.verify_tokens += real_bs * num_verify_tokens
+        self.verify_tokens += int(np.sum(decision.per_request_verify_tokens))
         self.last_decision = decision
         if self.rounds == 1 or self.rounds % 100 == 0:
             logger.info(
-                "DSPARK_CHAIN round=%d real_bs=%d verify_tokens=%d "
+                "DSPARK_CHAIN round=%d real_bs=%d verify_tokens_total=%d "
                 "predicted_range=[%d,%d] mean_confidence=%.4f",
                 self.rounds,
                 real_bs,
-                num_verify_tokens,
+                int(np.sum(decision.per_request_verify_tokens)),
                 int(np.min(decision.per_request_verify_tokens)),
                 int(np.max(decision.per_request_verify_tokens)),
-                float(np.mean(decision.confidence)),
+                (
+                    float(np.mean(decision.confidence))
+                    if decision.confidence.size
+                    else float("nan")
+                ),
             )
 
     def draft_extend_for_prefill(
@@ -564,9 +776,11 @@ class DSparkDraftWorker(BaseDraftWorker):
         hidden = hidden_states.reshape(batch_size, verify_tokens, -1)
         position_matrix = positions.reshape(batch_size, verify_tokens)
         accept = np.asarray(jax.device_get(accept_lens), dtype=np.int32)
-        accepted_mask = np.zeros((batch_size, verify_tokens), dtype=np.bool_)
-        for row in selector:
-            accepted_mask[row, : int(accept[row])] = True
+        selected_rows = np.zeros(batch_size, dtype=np.bool_)
+        selected_rows[selector] = True
+        accepted_mask = (
+            np.arange(verify_tokens, dtype=np.int32)[None, :] < accept[:, None]
+        ) & selected_rows[:, None]
         request_matrix = np.broadcast_to(request_indices[:, None], (batch_size, verify_tokens))
         request_rows = np.where(
             accepted_mask,
@@ -594,6 +808,104 @@ class DSparkWorker(BaseSpecWorker):
             target_worker,
             DSparkDraftWorker(server_args, target_worker),
         )
+        diagnostic_dir = os.getenv("SGL_JAX_DSPARK_DIAGNOSTIC_DIR")
+        self._diagnostic_dir = None if diagnostic_dir is None else Path(diagnostic_dir)
+        self._diagnostic_rounds = int(os.getenv("SGL_JAX_DSPARK_DIAGNOSTIC_ROUNDS", "0"))
+        if self._diagnostic_dir is not None:
+            self._diagnostic_dir.mkdir(parents=True, exist_ok=True)
+
+    def _capture_recurrent_rows(self, recurrent_indices: np.ndarray) -> dict[str, np.ndarray]:
+        recurrent_pool = self.target_worker.model_runner.memory_pools.recurrent_state_pool
+        if recurrent_pool is None:
+            return {}
+        safe_indices = np.maximum(recurrent_indices, 0)
+        arrays: dict[str, np.ndarray] = {}
+        for layer_index, layer_buffers in enumerate(recurrent_pool.conv_buffers):
+            for buffer_index, buffer in enumerate(layer_buffers):
+                arrays[f"conv_{layer_index}_{buffer_index}"] = np.asarray(
+                    jax.device_get(
+                        buffer.at[safe_indices].get(out_sharding=buffer.sharding)
+                    )
+                )
+        return arrays
+
+    def _capture_kv_rows(self, cache_locations: np.ndarray) -> dict[str, np.ndarray]:
+        token_pool = self.target_worker.model_runner.token_to_kv_pool
+        pages = cache_locations // token_pool.page_size
+        offsets = cache_locations % token_pool.page_size
+        arrays: dict[str, np.ndarray] = {}
+        for layer_id in range(
+            token_pool.start_layer,
+            token_pool.start_layer + token_pool.layer_num,
+        ):
+            buffer = token_pool.get_fused_kv_buffer(layer_id)
+            buffer_spec = buffer.sharding.spec
+            arrays[f"kv_{layer_id}"] = np.asarray(
+                jax.device_get(
+                    buffer.at[pages, offsets].get(
+                        out_sharding=NamedSharding(
+                            buffer.sharding.mesh,
+                            P(None, *buffer_spec[2:]),
+                        )
+                    )
+                )
+            )
+        return arrays
+
+    def _save_diagnostic_round(
+        self,
+        round_index: int,
+        spec_info: DSparkVerifyInput,
+        request_indices: np.ndarray,
+        recurrent_indices: np.ndarray,
+        pre_recurrent: dict[str, np.ndarray],
+        post_recurrent: dict[str, np.ndarray],
+        accepted: np.ndarray,
+    ) -> None:
+        if self._diagnostic_dir is None:
+            return
+        cache_locations = np.asarray(spec_info._diagnostic_cache_locations, dtype=np.int32)
+        arrays: dict[str, np.ndarray] = {
+            "request_indices": request_indices,
+            "recurrent_indices": recurrent_indices,
+            "positions": np.asarray(jax.device_get(spec_info.compact_positions), dtype=np.int32),
+            "cache_locations": cache_locations,
+            "verify_lens": np.asarray(spec_info.verify_lens, dtype=np.int32),
+            "verify_ids": np.asarray(jax.device_get(spec_info.verify_ids_strided), dtype=np.int32),
+            "target_predict": spec_info._diagnostic_target_predict,
+            "raw_logits": spec_info._diagnostic_raw_logits,
+            "hidden_states": spec_info._diagnostic_hidden_states,
+            "accepted_lengths": accepted,
+        }
+        arrays.update({f"pre_{name}": value for name, value in pre_recurrent.items()})
+        arrays.update({f"post_{name}": value for name, value in post_recurrent.items()})
+        arrays.update(self._capture_kv_rows(cache_locations))
+        route_layers = spec_info._diagnostic_layers_topk_ids
+        if route_layers is not None:
+            for layer_index, routes in enumerate(route_layers):
+                if routes is not None:
+                    arrays[f"routes_{layer_index}"] = np.asarray(jax.device_get(routes))
+        component_states = spec_info._diagnostic_component_states
+        if component_states is not None:
+            for component_index, component in enumerate(component_states):
+                arrays[f"component_{component_index}"] = np.asarray(
+                    jax.device_get(component)
+                )
+        candidate_inputs = spec_info._diagnostic_candidate_inputs
+        if candidate_inputs is not None:
+            for layer_index, layer_candidates in enumerate(candidate_inputs):
+                for buffer_index, candidates in enumerate(layer_candidates):
+                    arrays[f"candidate_{layer_index}_{buffer_index}"] = np.asarray(
+                        jax.device_get(candidates)
+                    )
+        path = self._diagnostic_dir / f"round-{round_index:06d}.npz"
+        np.savez(path, **arrays)
+        logger.info(
+            "DSPARK_DIAGNOSTIC_SAVED round=%d path=%s arrays=%d",
+            round_index,
+            path,
+            len(arrays),
+        )
 
     def verify(
         self,
@@ -601,13 +913,49 @@ class DSparkWorker(BaseSpecWorker):
         cur_allocate_lens: jax.Array,
     ) -> GenerationBatchResult:
         spec_info = model_worker_batch.spec_info_padded
-        if not isinstance(spec_info, EagleVerifyInput):
+        if not isinstance(spec_info, DSparkVerifyInput):
             raise TypeError(f"DSPARK_EXPECTED_VERIFY_INPUT got={type(spec_info).__name__}")
         verify_tokens = spec_info.draft_token_num
         request_indices = np.asarray(model_worker_batch.req_pool_indices, dtype=np.int32).copy()
+        recurrent_indices = np.asarray(model_worker_batch.recurrent_indices, dtype=np.int32).copy()
         selector = np.asarray(model_worker_batch.logits_indices_selector, dtype=np.int32).copy()
+        round_index = self.draft_worker.rounds
+        capture_round = (
+            self._diagnostic_dir is not None
+            and round_index <= self._diagnostic_rounds
+        )
+        pre_recurrent = (
+            self._capture_recurrent_rows(recurrent_indices)
+            if capture_round
+            else {}
+        )
         result = super().verify(model_worker_batch, cur_allocate_lens)
+        verify_lens = getattr(spec_info, "verify_lens", None)
+        if verify_lens is not None:
+            accepted_all = np.asarray(result.accept_lens, dtype=np.int32)
+            verify_lens_array = np.asarray(verify_lens, dtype=np.int32)
+            if np.any(accepted_all > verify_lens_array):
+                raise ValueError(
+                    "DSPARK_ACCEPT_EXCEEDS_VERIFY_LENGTH "
+                    f"accepted={accepted_all.tolist()} verify_lens={verify_lens_array.tolist()}"
+                )
+            padding = verify_lens_array == 0
+            if np.any(accepted_all[padding] != 0):
+                raise ValueError(
+                    "DSPARK_PADDING_ROW_ACCEPTED "
+                    f"accepted={accepted_all.tolist()} verify_lens={verify_lens_array.tolist()}"
+                )
         accepted = np.asarray(result.accept_lens, dtype=np.int32)[selector]
+        if capture_round:
+            self._save_diagnostic_round(
+                round_index,
+                spec_info,
+                request_indices,
+                recurrent_indices,
+                pre_recurrent,
+                self._capture_recurrent_rows(recurrent_indices),
+                np.asarray(result.accept_lens, dtype=np.int32),
+            )
         self.draft_worker.accepted_tokens += int(np.sum(accepted))
         self.draft_worker.verified_requests += int(selector.size)
         if self.draft_worker.rounds == 1 or self.draft_worker.rounds % 100 == 0:

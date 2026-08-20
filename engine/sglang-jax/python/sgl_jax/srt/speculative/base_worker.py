@@ -13,6 +13,7 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.speculative.overlap_utils import use_legacy_eagle3_non_overlap
+from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
@@ -29,6 +30,26 @@ def replicate_to_mesh(
     """
     out = jax.device_put(arrs, NamedSharding(mesh, P()))
     return out[0] if len(out) == 1 else out
+
+
+def prepare_target_outputs_for_verification(
+    mesh: jax.sharding.Mesh,
+    speculative_algorithm: SpeculativeAlgorithm,
+    logits: jax.Array,
+    hidden_states: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    if speculative_algorithm.is_dspark():
+        return logits, hidden_states
+    replicated = replicate_to_mesh(mesh, logits, hidden_states)
+    return replicated
+
+
+def gather_preserving_sharding(values: jax.Array, indices: jax.Array) -> jax.Array:
+    sharding = jax.typeof(values).sharding
+    selection = (indices,) + (slice(None),) * (values.ndim - 1)
+    if isinstance(sharding, NamedSharding):
+        return values.at[selection].get(out_sharding=sharding)
+    return values[selection]
 
 
 class BaseDraftWorker(ABC):
@@ -78,8 +99,6 @@ class BaseSpecWorker:
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.page_size = server_args.page_size
         self.mesh = target_worker.mesh
-
-        from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
@@ -318,8 +337,13 @@ class BaseSpecWorker:
         logits_output, _, cache_miss_count = self.target_worker.forward_batch_generation(
             model_worker_batch, skip_sample=True, forward_metadata=forward_metadata
         )
-        logits_output.next_token_logits, logits_output.hidden_states = replicate_to_mesh(
-            self.mesh, logits_output.next_token_logits, logits_output.hidden_states
+        logits_output.next_token_logits, logits_output.hidden_states = (
+            prepare_target_outputs_for_verification(
+                self.mesh,
+                self.speculative_algorithm,
+                logits_output.next_token_logits,
+                logits_output.hidden_states,
+            )
         )
         spec_info.hidden_states = logits_output.hidden_states
 
@@ -342,7 +366,22 @@ class BaseSpecWorker:
             not self.server_args.disable_overlap_schedule,
             getattr(model_worker_batch, "spec_algorithm", None),
         )
-        if legacy_non_overlap:
+        compact_verify_lens = getattr(spec_info, "verify_lens", None)
+        if compact_verify_lens is not None:
+            verify_lens = np.asarray(compact_verify_lens, dtype=np.int32)
+            offsets = np.concatenate(
+                (np.zeros(1, dtype=np.int32), np.cumsum(verify_lens, dtype=np.int32))
+            )
+            accept_matrix = np.asarray(accept_index).reshape(
+                len(verify_lens), spec_info.spec_steps + 1
+            )
+            fallback = np.maximum(offsets[:-1] + verify_lens - 1, 0)
+            safe_index = np.where(
+                accept_matrix >= 0,
+                accept_matrix,
+                fallback[:, None],
+            ).reshape(-1)
+        elif legacy_non_overlap:
             safe_index = accept_index
         else:
             # accept_index uses -1 for rejected slots; gathering with -1 picks the
@@ -356,9 +395,19 @@ class BaseSpecWorker:
             req_ids = np.arange(len(accept_index)) // accept_width
             per_req_last = req_ids * draft_n + draft_n - 1
             safe_index = np.where(accept_index >= 0, accept_index, per_req_last)
-        logits_output.next_token_logits = logits_output.next_token_logits[safe_index, :]
-        logits_output.hidden_states = logits_output.hidden_states[safe_index, :]
-        model_worker_batch.positions = model_worker_batch.positions[safe_index]
+        safe_index = jnp.asarray(safe_index, dtype=jnp.int32)
+        logits_output.next_token_logits = gather_preserving_sharding(
+            logits_output.next_token_logits,
+            safe_index,
+        )
+        logits_output.hidden_states = gather_preserving_sharding(
+            logits_output.hidden_states,
+            safe_index,
+        )
+        model_worker_batch.positions = gather_preserving_sharding(
+            model_worker_batch.positions,
+            safe_index,
+        )
         if legacy_non_overlap:
             # The legacy scheduler path advances seq_lens from accept_lens, as
             # it did before the relay-buffer/new_seq_lens path was introduced.

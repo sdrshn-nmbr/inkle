@@ -110,6 +110,17 @@ from sgl_jax.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
+
+def can_interleave_speculative_prefill(
+    enable_overlap: bool,
+    spec_algorithm: SpeculativeAlgorithm,
+) -> bool:
+    return (
+        enable_overlap
+        or spec_algorithm.is_dspark()
+        or use_legacy_eagle3_non_overlap(enable_overlap, spec_algorithm)
+    )
+
 # Test retract decode for debugging purposes
 TEST_RETRACT = get_bool_env_var("SGLANG_TEST_RETRACT")
 TEST_RETRACT_INTERVAL = int(os.environ.get("SGLANG_TEST_RETRACT_INTERVAL", "3"))
@@ -1813,10 +1824,8 @@ class Scheduler(
                     self._pd_pending_migrate = self.last_batch
                 elif self.running_batch.is_empty():
                     self.running_batch = self.last_batch
-                elif (
-                    not self._is_spec_decode_enabled()
-                    or self.enable_overlap
-                    or use_legacy_eagle3_non_overlap(self.enable_overlap, self.spec_algorithm)
+                elif not self._is_spec_decode_enabled() or can_interleave_speculative_prefill(
+                    self.enable_overlap, self.spec_algorithm
                 ):
                     # Spec overlap keeps prefill and decode as separate forwards, but
                     # once prefill has produced req-granular relay state it can join
@@ -1886,8 +1895,9 @@ class Scheduler(
 
         if (
             self._is_spec_decode_enabled()
-            and not self.enable_overlap
-            and not use_legacy_eagle3_non_overlap(self.enable_overlap, self.spec_algorithm)
+            and not can_interleave_speculative_prefill(
+                self.enable_overlap, self.spec_algorithm
+            )
             and not self.running_batch.is_empty()
         ):
             return None

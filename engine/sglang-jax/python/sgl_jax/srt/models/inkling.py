@@ -1,4 +1,6 @@
 import logging
+import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import NamedTuple
 
 import jax
@@ -9,6 +11,7 @@ from flax import nnx
 from jax.scipy.special import logsumexp
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
+from jax.sharding import SingleDeviceSharding
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
@@ -57,6 +60,23 @@ def _slice_bounds(index: slice, size: int) -> tuple[int, int]:
     if step != 1:
         raise ValueError(f"INKLING_UNSUPPORTED_SHARD_STEP step={step}")
     return start, stop
+
+
+def _make_array_from_parallel_callbacks(
+    shape: tuple[int, ...],
+    sharding: NamedSharding,
+    callback,
+) -> jax.Array:
+    devices = list(sharding.addressable_devices)
+    indices = sharding.addressable_devices_indices_map(shape)
+    with ThreadPoolExecutor(max_workers=len(devices)) as executor:
+        host_arrays = list(executor.map(lambda device: callback(indices[device]), devices))
+    device_arrays = [
+        jax.device_put(array, SingleDeviceSharding(device))
+        for device, array in zip(devices, host_arrays, strict=True)
+    ]
+    result = jax.make_array_from_single_device_arrays(shape, sharding, device_arrays)
+    return jax.block_until_ready(result)
 
 
 def split_interleaved_gate_up(
@@ -170,10 +190,15 @@ class InklingShortConvolution(nnx.Module):
                         "INKLING_RECURRENT_VERIFY_REQUIRES_FIXED_CHAIN "
                         f"topk={None if spec_info is None else spec_info.topk}"
                     )
-                sequence_lengths = jnp.full(
-                    (forward_batch.batch_size,),
-                    spec_info.draft_token_num,
-                    dtype=jnp.int32,
+                verify_lens = getattr(spec_info, "verify_lens", None)
+                sequence_lengths = (
+                    jnp.full(
+                        (forward_batch.batch_size,),
+                        spec_info.draft_token_num,
+                        dtype=jnp.int32,
+                    )
+                    if verify_lens is None
+                    else jnp.asarray(verify_lens, dtype=jnp.int32)
                 )
             else:
                 sequence_lengths = (
@@ -211,7 +236,7 @@ class InklingShortConvolution(nnx.Module):
             activation=None,
             x_window_sharding=NamedSharding(self.mesh, P("data", None, "tensor")),
             cache_window_sharding=NamedSharding(self.mesh, P("data", "tensor", None)),
-            backend=(None if forward_batch.forward_mode.is_target_verify() else "pallas"),
+            backend="pallas",
         )
         new_state_table = None
         if state_table is not None:
@@ -528,12 +553,14 @@ class InklingAttention(nnx.Module):
         jax.Array,
         tuple[jax.Array, jax.Array] | None,
         tuple[jax.Array, jax.Array] | None,
+        tuple[jax.Array, ...],
     ]:
         token_count = hidden_states.shape[0]
         query = stable_bfloat16_linear(self.q_proj, hidden_states)
         key = stable_bfloat16_linear(self.k_proj, hidden_states)
         value = stable_bfloat16_linear(self.v_proj, hidden_states)
         relative = stable_bfloat16_linear(self.r_proj, hidden_states)
+        linear_states = (query, key, value, relative)
         key_state = convolution_states[0] if convolution_states is not None else None
         value_state = convolution_states[1] if convolution_states is not None else None
         key_conv = self.k_sconv.apply(key, forward_batch, key_state)
@@ -570,7 +597,16 @@ class InklingAttention(nnx.Module):
             state_updates = (key_conv.state_table, value_conv.state_table)
             if key_conv.candidate_input is not None:
                 candidate_inputs = (key_conv.candidate_input, value_conv.candidate_input)
-        return output, kv_fused, state_updates, candidate_inputs
+        diagnostics = (
+            *linear_states,
+            key_conv.hidden_states,
+            value_conv.hidden_states,
+            query,
+            key,
+            attended,
+            output,
+        )
+        return output, kv_fused, state_updates, candidate_inputs, diagnostics
 
 
 class InklingDecoderLayer(nnx.Module):
@@ -584,6 +620,7 @@ class InklingDecoderLayer(nnx.Module):
     ):
         self.layer_id = layer_id
         self.mesh = mesh
+        self.capture_diagnostics = bool(os.getenv("SGL_JAX_DSPARK_DIAGNOSTIC_DIR")) and layer_id < 2
         self.is_dense = layer_id < config.dense_mlp_idx
         self.self_attn = InklingAttention(config, layer_id, mesh, dtype)
         self.input_layernorm = RMSNorm(
@@ -616,15 +653,23 @@ class InklingDecoderLayer(nnx.Module):
         jax.Array | None,
         list[jax.Array] | None,
         tuple[jax.Array, ...] | None,
+        tuple[jax.Array, ...],
     ]:
         residual = hidden_states
         normalized = self.input_layernorm(hidden_states)
+        diagnostic_prefix = (hidden_states, normalized)
         attention_states = (
             (convolution_states[0], convolution_states[1])
             if convolution_states is not None
             else None
         )
-        attended, kv_fused, attention_state_updates, attention_candidate_inputs = self.self_attn(
+        (
+            attended,
+            kv_fused,
+            attention_state_updates,
+            attention_candidate_inputs,
+            attention_diagnostics,
+        ) = self.self_attn(
             positions,
             normalized,
             forward_batch,
@@ -635,6 +680,7 @@ class InklingDecoderLayer(nnx.Module):
         attn_conv = self.attn_sconv.apply(attended, forward_batch, attn_state)
         convolved_attention = attn_conv.hidden_states
         hidden_states = residual + convolved_attention
+        after_attention = hidden_states
 
         residual = hidden_states
         normalized = self.post_attention_layernorm(hidden_states)
@@ -666,7 +712,20 @@ class InklingDecoderLayer(nnx.Module):
                 attn_conv.candidate_input,
                 mlp_conv.candidate_input,
             )
-        return hidden_states, kv_fused, topk_ids, state_updates, candidate_inputs
+        diagnostics = (
+            *diagnostic_prefix,
+            *attention_diagnostics,
+            convolved_attention,
+            after_attention,
+            normalized,
+            transformed,
+            convolved_mlp,
+            hidden_states,
+        ) if self.capture_diagnostics else ()
+        output = (hidden_states, kv_fused, topk_ids, state_updates, candidate_inputs)
+        if self.capture_diagnostics:
+            return (*output, diagnostics)
+        return output
 
 
 class InklingModel(nnx.Module):
@@ -705,6 +764,7 @@ class InklingModel(nnx.Module):
         layers_kv_fused = []
         layers_topk_ids = []
         auxiliary_hidden_states = []
+        diagnostic_hidden_states = []
         recurrent_candidate_inputs = []
         recurrent_state_pool = getattr(memory_pools, "recurrent_state_pool", None)
         conv_updates = None
@@ -715,15 +775,28 @@ class InklingModel(nnx.Module):
             if recurrent_state_pool is not None:
                 layer_index = recurrent_state_pool.layers_mapping[layer.layer_id]
                 layer_states = conv_updates[layer_index]
-            hidden_states, kv_fused, topk_ids, state_updates, candidate_inputs = layer(
+            layer_output = layer(
                 forward_batch.positions,
                 hidden_states,
                 forward_batch,
                 memory_pools.token_to_kv_pool,
                 layer_states,
             )
+            if getattr(layer, "capture_diagnostics", False):
+                (
+                    hidden_states,
+                    kv_fused,
+                    topk_ids,
+                    state_updates,
+                    candidate_inputs,
+                    layer_diagnostics,
+                ) = layer_output
+            else:
+                hidden_states, kv_fused, topk_ids, state_updates, candidate_inputs = layer_output
+                layer_diagnostics = ()
             layers_kv_fused.append(kv_fused)
             layers_topk_ids.append(topk_ids)
+            diagnostic_hidden_states.extend(layer_diagnostics)
             if layer.layer_id in self.layers_to_capture:
                 auxiliary_hidden_states.append(hidden_states)
             if state_updates is not None:
@@ -742,12 +815,13 @@ class InklingModel(nnx.Module):
                 candidate_inputs=tuple(recurrent_candidate_inputs),
                 recurrent_indices=forward_batch.recurrent_indices,
                 draft_token_num=forward_batch.spec_info.draft_token_num,
+                verify_lens=getattr(forward_batch.spec_info, "verify_lens", None),
             )
         return InklingModelOutput(
             hidden_states=self.norm(hidden_states),
             auxiliary_hidden_states=tuple(auxiliary_hidden_states),
             pool_updates=pool_updates,
-            layers_topk_ids=layers_topk_ids,
+            layers_topk_ids=layers_topk_ids + diagnostic_hidden_states,
             recurrent_state_transaction=recurrent_state_transaction,
         )
 
@@ -979,8 +1053,12 @@ class InklingForCausalLM(nnx.Module):
             w13_scale2_reader = self._reader(file_manager, weight_info, f"{w13_name}.scale2")
             w2_scale_reader = self._reader(file_manager, weight_info, f"{w2_name}.scale")
             w2_scale2_reader = self._reader(file_manager, weight_info, f"{w2_name}.scale2")
+        w13_decoded: dict[tuple[slice, ...], tuple[np.ndarray, np.ndarray]] = {}
 
         def read_w13(index: tuple[slice, ...], parity: int) -> np.ndarray:
+            cached = w13_decoded.get(index)
+            if cached is not None:
+                return cached[parity]
             expert_slice, hidden_slice, intermediate_slice = index
             expert_start, expert_stop = _slice_bounds(
                 expert_slice, self.text_config.n_routed_experts
@@ -1003,7 +1081,12 @@ class InklingForCausalLM(nnx.Module):
                 raw = decode_nvfp4_numpy(raw, block_scale, global_scale)
             else:
                 raw = raw.astype(ml_dtypes.bfloat16, copy=False)
-            return np.transpose(raw[:, parity::2, :], (0, 2, 1))
+            pair = (
+                np.transpose(raw[:, 0::2, :], (0, 2, 1)),
+                np.transpose(raw[:, 1::2, :], (0, 2, 1)),
+            )
+            w13_decoded[index] = pair
+            return pair[parity]
 
         def read_w2(index: tuple[slice, ...]) -> np.ndarray:
             expert_slice, intermediate_slice, hidden_slice = index
@@ -1054,17 +1137,18 @@ class InklingForCausalLM(nnx.Module):
 
         w13_sharding = NamedSharding(experts.moe_mesh, P("expert", None, "tensor"))
         w2_sharding = NamedSharding(experts.moe_mesh, P("expert", "tensor", None))
-        experts.wi_0.value = jax.make_array_from_callback(
+        experts.wi_0.value = _make_array_from_parallel_callbacks(
             experts.wi_0.shape,
             w13_sharding,
             lambda index: read_w13(index, 0),
         ).astype(self.dtype)
-        experts.wi_1.value = jax.make_array_from_callback(
+        experts.wi_1.value = _make_array_from_parallel_callbacks(
             experts.wi_1.shape,
             w13_sharding,
             lambda index: read_w13(index, 1),
         ).astype(self.dtype)
-        experts.wo.value = jax.make_array_from_callback(
+        w13_decoded.clear()
+        experts.wo.value = _make_array_from_parallel_callbacks(
             experts.wo.shape,
             w2_sharding,
             read_w2,

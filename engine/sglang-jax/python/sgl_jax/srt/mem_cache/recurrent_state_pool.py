@@ -76,14 +76,19 @@ class RecurrentConvStateTransaction:
     candidate_inputs: tuple[tuple[jax.Array, ...], ...]
     recurrent_indices: jax.Array
     draft_token_num: int
+    verify_lens: jax.Array | None = None
 
     def tree_flatten(self):
-        return (self.candidate_inputs, self.recurrent_indices), self.draft_token_num
+        return (
+            self.candidate_inputs,
+            self.recurrent_indices,
+            self.verify_lens,
+        ), self.draft_token_num
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
-        candidate_inputs, recurrent_indices = children
-        return cls(candidate_inputs, recurrent_indices, aux_data)
+        candidate_inputs, recurrent_indices, verify_lens = children
+        return cls(candidate_inputs, recurrent_indices, aux_data, verify_lens)
 
 
 def commit_packed_convolution_state(
@@ -92,10 +97,17 @@ def commit_packed_convolution_state(
     recurrent_indices: jax.Array,
     accepted_lengths: jax.Array,
     draft_token_num: int,
+    verify_lens: jax.Array | None = None,
 ) -> jax.Array:
     """Commit only each request's accepted fixed-chain candidate prefix."""
     batch_size = recurrent_indices.shape[0]
-    if candidate_inputs.shape[0] != batch_size * draft_token_num:
+    expected_tokens = batch_size * draft_token_num
+    invalid_token_count = (
+        candidate_inputs.shape[0] != expected_tokens
+        if verify_lens is None
+        else candidate_inputs.shape[0] > expected_tokens
+    )
+    if invalid_token_count:
         raise ValueError(
             "RECURRENT_CANDIDATE_LAYOUT_MISMATCH "
             f"tokens={candidate_inputs.shape[0]} batch={batch_size} "
@@ -109,11 +121,34 @@ def commit_packed_convolution_state(
 
     cache_width = state_table.shape[-1]
     state_sharding = jax.typeof(state_table).sharding
-    candidates = candidate_inputs.reshape(
-        batch_size,
-        draft_token_num,
-        candidate_inputs.shape[-1],
-    ).swapaxes(1, 2)
+    if verify_lens is None:
+        candidates = candidate_inputs.reshape(
+            batch_size,
+            draft_token_num,
+            candidate_inputs.shape[-1],
+        )
+    else:
+        verify_lens = jax.sharding.reshard(
+            verify_lens.astype(jnp.int32),
+            NamedSharding(state_sharding.mesh, P()),
+        )
+        offsets = jnp.concatenate(
+            (jnp.zeros((1,), dtype=jnp.int32), jnp.cumsum(verify_lens, axis=0))
+        )
+        gather_indices = offsets[:-1, None] + jnp.arange(
+            draft_token_num, dtype=jnp.int32
+        )[None, :]
+        valid = jnp.arange(draft_token_num, dtype=jnp.int32)[None, :] < verify_lens[:, None]
+        safe_indices = jnp.minimum(gather_indices, candidate_inputs.shape[0] - 1)
+        gather_sharding = NamedSharding(
+            state_sharding.mesh,
+            P(state_sharding.spec[0], None, state_sharding.spec[1]),
+        )
+        candidates = candidate_inputs.at[safe_indices].get(
+            out_sharding=gather_sharding
+        )
+        candidates = jnp.where(valid[:, :, None], candidates, 0)
+    candidates = candidates.swapaxes(1, 2)
     candidates = jax.sharding.reshard(candidates, state_sharding)
     safe_indices = jnp.maximum(recurrent_indices, 0)
     old_rows = state_table.at[safe_indices].get(out_sharding=state_sharding)
@@ -139,6 +174,7 @@ def commit_convolution_transaction_buffers(
     recurrent_indices: jax.Array,
     accepted_lengths: jax.Array,
     draft_token_num: int,
+    verify_lens: jax.Array | None = None,
 ) -> tuple[tuple[jax.Array, ...], ...]:
     return tuple(
         tuple(
@@ -148,6 +184,7 @@ def commit_convolution_transaction_buffers(
                 recurrent_indices,
                 accepted_lengths,
                 draft_token_num,
+                verify_lens,
             )
             for candidates, state_table in zip(layer_candidates, layer_buffers, strict=True)
         )
@@ -452,6 +489,7 @@ class RecurrentStatePool:
             recurrent_indices,
             accepted_lengths,
             transaction.draft_token_num,
+            transaction.verify_lens,
         )
         self.conv_buffers = [list(layer) for layer in new_conv]
 

@@ -759,6 +759,39 @@ def _build_recurrent_cow_src_indices(reqs: list[Req]) -> np.ndarray | None:
     return np.asarray(vals, dtype=np.int32)
 
 
+def _merge_recurrent_rows(
+    left: np.ndarray | None,
+    right: np.ndarray | None,
+    *,
+    left_size: int,
+    right_size: int,
+    fill_value: int | bool,
+    field_name: str,
+) -> np.ndarray | None:
+    if left is None and right is None:
+        return None
+
+    if left is not None and len(left) != left_size:
+        raise RuntimeError(
+            f"RECURRENT_BATCH_FIELD_MISMATCH: {field_name} has {len(left)} rows "
+            f"for a {left_size}-request running batch"
+        )
+    if right is not None and len(right) != right_size:
+        raise RuntimeError(
+            f"RECURRENT_BATCH_FIELD_MISMATCH: {field_name} has {len(right)} rows "
+            f"for a {right_size}-request admitted batch"
+        )
+
+    dtype = left.dtype if left is not None else right.dtype
+    left_rows = (
+        left if left is not None else np.full(left_size, fill_value, dtype=dtype)
+    )
+    right_rows = (
+        right if right is not None else np.full(right_size, fill_value, dtype=dtype)
+    )
+    return np.concatenate([left_rows, right_rows])
+
+
 class _RecurrentTrackEntry(NamedTuple):
     track_mask: bool
     track_index: int
@@ -1963,7 +1996,16 @@ class ScheduleBatch:
                 self_info.top_logprobs_nums = other_info.top_logprobs_nums
                 self_info.token_ids_logprobs = other_info.token_ids_logprobs
                 self_info.spec_info = other_info.spec_info
+                self_info.recurrent_indices = other_info.recurrent_indices
+                self_info.recurrent_cow_src_indices = (
+                    other_info.recurrent_cow_src_indices
+                )
+                self_info.recurrent_track_indices = other_info.recurrent_track_indices
+                self_info.recurrent_track_mask = other_info.recurrent_track_mask
                 continue
+
+            self_size = len(self_info.reqs)
+            other_size = len(other_info.reqs)
 
             # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
             # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
@@ -1978,6 +2020,38 @@ class ScheduleBatch:
             self_info.seq_lens = np.concat([self_info.seq_lens, other_info.seq_lens])
             self_info.out_cache_loc = None  # Will be recomputed
             self_info.seq_lens_sum += other_info.seq_lens_sum
+            self_info.recurrent_indices = _merge_recurrent_rows(
+                self_info.recurrent_indices,
+                other_info.recurrent_indices,
+                left_size=self_size,
+                right_size=other_size,
+                fill_value=0,
+                field_name="recurrent_indices",
+            )
+            self_info.recurrent_cow_src_indices = _merge_recurrent_rows(
+                self_info.recurrent_cow_src_indices,
+                other_info.recurrent_cow_src_indices,
+                left_size=self_size,
+                right_size=other_size,
+                fill_value=0,
+                field_name="recurrent_cow_src_indices",
+            )
+            self_info.recurrent_track_indices = _merge_recurrent_rows(
+                self_info.recurrent_track_indices,
+                other_info.recurrent_track_indices,
+                left_size=self_size,
+                right_size=other_size,
+                fill_value=0,
+                field_name="recurrent_track_indices",
+            )
+            self_info.recurrent_track_mask = _merge_recurrent_rows(
+                self_info.recurrent_track_mask,
+                other_info.recurrent_track_mask,
+                left_size=self_size,
+                right_size=other_size,
+                fill_value=False,
+                field_name="recurrent_track_mask",
+            )
 
             # Merge output_ids
             if self_info.output_ids is not None and other_info.output_ids is not None:

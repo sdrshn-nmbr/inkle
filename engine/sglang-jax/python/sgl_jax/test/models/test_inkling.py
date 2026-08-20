@@ -31,6 +31,7 @@ from sgl_jax.srt.models.inkling import (
     InklingForCausalLM,
     InklingMoE,
     InklingShortConvolution,
+    _make_array_from_parallel_callbacks,
 )
 from sgl_jax.srt.models.inkling_layout import decode_nvfp4_numpy
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
@@ -195,6 +196,18 @@ class TestInklingLayout(unittest.TestCase):
 
 
 class TestInklingModel(unittest.TestCase):
+    def test_parallel_weight_callback_builds_named_sharded_array(self):
+        sharding = jax.sharding.NamedSharding(
+            MESH, jax.sharding.PartitionSpec("data", None)
+        )
+        array = _make_array_from_parallel_callbacks(
+            (2, 3),
+            sharding,
+            lambda index: np.arange(6, dtype=np.float32).reshape(2, 3)[index],
+        )
+
+        np.testing.assert_array_equal(np.asarray(array), np.arange(6).reshape(2, 3))
+
     def test_target_verify_uses_fused_relative_attention_on_tpu(self):
         attention = NativeAttention(4, 2, 128, MESH)
         expected = object()
@@ -664,6 +677,143 @@ class TestInklingModel(unittest.TestCase):
             np.asarray(pool.conv_buffers[0][1][1]),
             np.asarray([[0, 101, 102], [0, 110, 120]], dtype=np.float32),
         )
+
+    def test_compact_convolution_transaction_commits_each_accepted_prefix(self):
+        pool = RecurrentStatePool(
+            linear_recurrent_layer_ids=[0],
+            size=2,
+            num_heads=1,
+            head_dim=1,
+            conv_kernel_size=4,
+            mesh=MESH,
+            conv_channel_sizes=[[1]],
+            has_temporal_state=False,
+        )
+        pool.conv_buffers = [[jnp.zeros((3, 1, 3), dtype=jnp.bfloat16)]]
+        transaction = RecurrentConvStateTransaction(
+            candidate_inputs=(
+                (
+                    jnp.asarray([[1], [2], [3], [10], [11]], dtype=jnp.bfloat16),
+                ),
+            ),
+            recurrent_indices=jnp.asarray([1, 2], dtype=jnp.int32),
+            draft_token_num=3,
+            verify_lens=jnp.asarray([3, 2], dtype=jnp.int32),
+        )
+
+        pool.commit_convolution_transaction(
+            transaction,
+            jnp.asarray([2, 1], dtype=jnp.int32),
+        )
+
+        np.testing.assert_array_equal(
+            np.asarray(pool.conv_buffers[0][0][1, 0]),
+            np.asarray([0, 1, 2], dtype=np.float32),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(pool.conv_buffers[0][0][2, 0]),
+            np.asarray([0, 0, 10], dtype=np.float32),
+        )
+
+    def test_compact_convolution_transaction_ignores_zero_length_rows(self):
+        pool = RecurrentStatePool(
+            linear_recurrent_layer_ids=[0],
+            size=5,
+            num_heads=1,
+            head_dim=1,
+            conv_kernel_size=4,
+            mesh=MESH,
+            conv_channel_sizes=[[1]],
+            has_temporal_state=False,
+        )
+        initial = jnp.asarray(
+            [
+                [[90, 91, 92]],
+                [[10, 11, 12]],
+                [[20, 21, 22]],
+                [[30, 31, 32]],
+                [[40, 41, 42]],
+                [[50, 51, 52]],
+            ],
+            dtype=jnp.bfloat16,
+        )
+        pool.conv_buffers = [[initial]]
+        transaction = RecurrentConvStateTransaction(
+            candidate_inputs=(
+                (
+                    jnp.asarray(
+                        [[1], [2], [3], [4], [10], [20], [21], [22]],
+                        dtype=jnp.bfloat16,
+                    ),
+                ),
+            ),
+            recurrent_indices=jnp.asarray([1, 0, 2, 0, 3], dtype=jnp.int32),
+            draft_token_num=4,
+            verify_lens=jnp.asarray([4, 0, 1, 0, 3], dtype=jnp.int32),
+        )
+
+        pool.commit_convolution_transaction(
+            transaction,
+            jnp.asarray([3, 0, 1, 0, 2], dtype=jnp.int32),
+        )
+
+        np.testing.assert_array_equal(np.asarray(pool.conv_buffers[0][0][0]), [[90, 91, 92]])
+        np.testing.assert_array_equal(np.asarray(pool.conv_buffers[0][0][1]), [[1, 2, 3]])
+        np.testing.assert_array_equal(np.asarray(pool.conv_buffers[0][0][2]), [[21, 22, 10]])
+        np.testing.assert_array_equal(np.asarray(pool.conv_buffers[0][0][3]), [[32, 20, 21]])
+        np.testing.assert_array_equal(np.asarray(pool.conv_buffers[0][0][4]), [[40, 41, 42]])
+        np.testing.assert_array_equal(np.asarray(pool.conv_buffers[0][0][5]), [[50, 51, 52]])
+
+    def test_compact_convolution_transaction_declares_tensor_sharded_gather(self):
+        if len(jax.devices()) < 8:
+            self.skipTest("requires eight CPU devices")
+        mesh = create_device_mesh(
+            ici_parallelism=[1, 8],
+            dcn_parallelism=[1, 1],
+            devices=jax.devices()[:8],
+        )
+        with jax.set_mesh(mesh):
+            pool = RecurrentStatePool(
+                linear_recurrent_layer_ids=[0],
+                size=2,
+                num_heads=8,
+                head_dim=1,
+                conv_kernel_size=4,
+                mesh=mesh,
+                conv_channel_sizes=[[8]],
+                has_temporal_state=False,
+            )
+        candidate_sharding = jax.sharding.NamedSharding(
+            mesh, jax.sharding.PartitionSpec("data", "tensor")
+        )
+        candidates = jax.device_put(
+            jnp.arange(40, dtype=jnp.bfloat16).reshape(5, 8),
+            candidate_sharding,
+        )
+        data_sharding = jax.sharding.NamedSharding(
+            mesh, jax.sharding.PartitionSpec("data")
+        )
+        replicated_sharding = jax.sharding.NamedSharding(
+            mesh, jax.sharding.PartitionSpec()
+        )
+        transaction = RecurrentConvStateTransaction(
+            candidate_inputs=((candidates,),),
+            recurrent_indices=jax.device_put(
+                jnp.asarray([1, 2], dtype=jnp.int32), data_sharding
+            ),
+            draft_token_num=3,
+            verify_lens=jax.device_put(
+                jnp.asarray([3, 2], dtype=jnp.int32), replicated_sharding
+            ),
+        )
+
+        with jax.set_mesh(mesh):
+            pool.commit_convolution_transaction(
+                transaction,
+                jnp.asarray([2, 1], dtype=jnp.int32),
+            )
+
+        self.assertEqual(pool.conv_buffers[0][0].shape, (3, 8, 3))
 
     def test_short_convolution_can_be_traced(self):
         convolution = InklingShortConvolution(4, 4, MESH)
