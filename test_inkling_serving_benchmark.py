@@ -67,6 +67,48 @@ def test_concurrent_request_uses_pinned_input_ids(monkeypatch) -> None:
     assert "text" not in captured["json"]
 
 
+def test_concurrent_request_compacts_cumulative_intermediate_outputs(monkeypatch) -> None:
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def iter_lines(self):
+            return [
+                b'data: {"text":"one","output_ids":[1],'
+                b'"meta_info":{"completion_tokens":1}}',
+                b'data: {"text":"one two","output_ids":[1,2],'
+                b'"meta_info":{"completion_tokens":2}}',
+                b"data: [DONE]",
+            ]
+
+    monkeypatch.setattr(
+        "inkling_serving_benchmark.requests.post",
+        lambda *args, **kwargs: FakeResponse(),
+    )
+
+    result = stream_request(
+        "http://server",
+        "prompt",
+        None,
+        2,
+        threading.Barrier(1),
+        True,
+        False,
+    )
+
+    assert result["chunks"][0]["response"] == {
+        "meta_info": {"completion_tokens": 1}
+    }
+    assert result["chunks"][1]["response"]["text"] == "one two"
+    assert result["chunks"][1]["response"]["output_ids"] == [1, 2]
+
+
 def test_concurrent_request_aborts_group_after_first_completion(monkeypatch) -> None:
     posts = []
 

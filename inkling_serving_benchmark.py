@@ -87,6 +87,7 @@ def stream_request(
             if payload == b"[DONE]":
                 break
             output = json.loads(payload)
+            compact_previous_chunk(chunks)
             chunks.append(
                 {
                     "elapsed_ms": (time.perf_counter_ns() - start_ns) / 1e6,
@@ -303,7 +304,9 @@ def run_batch_group(
                 break
             elapsed_ms = (time.perf_counter_ns() - start_ns) / 1e6
             output = json.loads(payload)
-            chunks_by_request[output.pop("index")].append(
+            request_chunks = chunks_by_request[output.pop("index")]
+            compact_previous_chunk(request_chunks)
+            request_chunks.append(
                 {"elapsed_ms": elapsed_ms, "response": output}
             )
     end_ns = time.perf_counter_ns()
@@ -527,6 +530,14 @@ def completion_token_deltas(chunks: list[dict[str, object]]) -> list[int]:
         current - previous
         for previous, current in zip([0, *cumulative[:-1]], cumulative, strict=True)
     ]
+
+
+def compact_previous_chunk(chunks: list[dict[str, object]]) -> None:
+    if not chunks:
+        return
+    response = chunks[-1]["response"]
+    response.pop("text", None)
+    response.pop("output_ids", None)
 
 
 def output_multiset_signature(group: dict[str, object]) -> tuple[str, ...]:
