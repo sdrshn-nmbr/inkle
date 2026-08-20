@@ -106,6 +106,12 @@ def stream_request(
                     timeout=30,
                 )
                 abort_response.raise_for_status()
+            if (
+                stop_after_first_completion
+                and stop_event is not None
+                and stop_event.is_set()
+            ):
+                break
     end_ns = time.perf_counter_ns()
     first_ms = chunks[0]["elapsed_ms"] if chunks else None
     arrival_ms = [chunk["elapsed_ms"] for chunk in chunks]
@@ -132,8 +138,13 @@ def wait_for_server_idle(
     deadline = time.monotonic() + timeout_seconds
     last_state = None
     while time.monotonic() < deadline:
-        response = requests.get(f"{url}/get_server_info", timeout=30)
-        response.raise_for_status()
+        try:
+            response = requests.get(f"{url}/get_server_info", timeout=30)
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            last_state = {"poll_error": repr(exc)}
+            time.sleep(poll_seconds)
+            continue
         states = response.json()["internal_states"]
         last_state = states
         if all(
@@ -200,7 +211,9 @@ def run_group(
                 ).raise_for_status()
     if request_mode == "batch":
         if stop_after_first_completion:
-            raise ValueError("First-completion stopping requires concurrent request mode")
+            raise ValueError(
+                "First-completion stopping requires concurrent request mode"
+            )
         return run_batch_group(
             url,
             prompt,
@@ -304,7 +317,9 @@ def run_batch_group(
                 "e2e_ms": (end_ns - start_ns) / 1e6,
                 "inter_token_ms": [
                     current - previous
-                    for previous, current in zip(arrival_ms, arrival_ms[1:], strict=False)
+                    for previous, current in zip(
+                        arrival_ms, arrival_ms[1:], strict=False
+                    )
                 ],
                 "request": request_body,
                 "time_to_first_token_ms": arrival_ms[0] if arrival_ms else None,
@@ -381,7 +396,8 @@ def summarize(groups: list[dict[str, object]]) -> dict[str, object]:
             ),
             "fully_active_throughput_median_tokens_per_second": (
                 statistics.median(
-                    metrics["throughput_tokens_per_second"] for metrics in full_batch_metrics
+                    metrics["throughput_tokens_per_second"]
+                    for metrics in full_batch_metrics
                 )
                 if full_batch_metrics
                 else None
@@ -474,28 +490,24 @@ def fully_active_metrics(group: dict[str, object]) -> dict[str, float]:
     start_ms = segment[0][0]
     end_ms = segment[-1][0]
 
-    token_count = sum(
-        event[4] for event in segment if start_ms < event[0] <= end_ms
-    )
+    token_count = sum(event[4] for event in segment if start_ms < event[0] <= end_ms)
     model_steps = [
         request["inter_token_ms"][index]
         for request in requests_out
         for index in range(len(request["inter_token_ms"]))
         if start_ms <= request["chunks"][index]["elapsed_ms"]
         and request["chunks"][index + 1]["elapsed_ms"] <= end_ms
-        and int(
-            request["chunks"][index]["response"]["meta_info"]["server_batch_size"]
-        )
+        and int(request["chunks"][index]["response"]["meta_info"]["server_batch_size"])
         == expected_batch_size
         and int(
-            request["chunks"][index + 1]["response"]["meta_info"][
-                "server_batch_size"
-            ]
+            request["chunks"][index + 1]["response"]["meta_info"]["server_batch_size"]
         )
         == expected_batch_size
     ]
     if token_count <= 0 or not model_steps:
-        raise ValueError("Full-server-batch interval contains no measurable model steps")
+        raise ValueError(
+            "Full-server-batch interval contains no measurable model steps"
+        )
     return {
         "model_step_median_ms": statistics.median(model_steps),
         "throughput_tokens_per_second": token_count * 1000 / (end_ms - start_ms),
@@ -509,8 +521,7 @@ def fully_active_metrics(group: dict[str, object]) -> dict[str, float]:
 
 def completion_token_deltas(chunks: list[dict[str, object]]) -> list[int]:
     cumulative = [
-        int(chunk["response"]["meta_info"]["completion_tokens"])
-        for chunk in chunks
+        int(chunk["response"]["meta_info"]["completion_tokens"]) for chunk in chunks
     ]
     return [
         current - previous
@@ -532,9 +543,7 @@ def output_multiset_signature(group: dict[str, object]) -> tuple[str, ...]:
 
 def request_state_slot(request: dict[str, object]) -> int:
     chunks = request["chunks"]
-    slots = {
-        chunk["response"]["meta_info"]["request_state_slot"] for chunk in chunks
-    }
+    slots = {chunk["response"]["meta_info"]["request_state_slot"] for chunk in chunks}
     if len(slots) != 1:
         raise ValueError(f"Request changed state slots while decoding: {sorted(slots)}")
     return slots.pop()
@@ -542,9 +551,7 @@ def request_state_slot(request: dict[str, object]) -> int:
 
 def request_recurrent_state_slot(request: dict[str, object]) -> int:
     chunks = request["chunks"]
-    slots = {
-        chunk["response"]["meta_info"]["recurrent_state_slot"] for chunk in chunks
-    }
+    slots = {chunk["response"]["meta_info"]["recurrent_state_slot"] for chunk in chunks}
     if len(slots) != 1:
         raise ValueError(f"Request changed recurrent-state slots: {sorted(slots)}")
     slot = slots.pop()

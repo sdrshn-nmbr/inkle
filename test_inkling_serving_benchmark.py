@@ -2,6 +2,7 @@ import sys
 import threading
 
 import pytest
+import requests
 
 from inkling_serving_benchmark import (
     fully_active_metrics,
@@ -119,6 +120,44 @@ def test_concurrent_request_aborts_group_after_first_completion(monkeypatch) -> 
     )
 
 
+def test_concurrent_request_stops_reading_after_peer_finishes(monkeypatch) -> None:
+    stop_event = threading.Event()
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def iter_lines(self):
+            stop_event.set()
+            yield b'data: {"text":"one","meta_info":{"completion_tokens":1}}'
+            yield b'data: {"text":"two","meta_info":{"completion_tokens":2}}'
+
+    monkeypatch.setattr(
+        "inkling_serving_benchmark.requests.post",
+        lambda *args, **kwargs: FakeResponse(),
+    )
+
+    result = stream_request(
+        "http://server",
+        "prompt",
+        None,
+        8,
+        threading.Barrier(1),
+        True,
+        False,
+        True,
+        stop_event,
+    )
+
+    assert len(result["chunks"]) == 1
+
+
 def test_wait_for_server_idle_waits_for_scheduler_and_pool_cleanup(monkeypatch) -> None:
     states = iter(
         [
@@ -157,6 +196,44 @@ def test_wait_for_server_idle_waits_for_scheduler_and_pool_cleanup(monkeypatch) 
         "inkling_serving_benchmark.requests.get",
         lambda url, timeout: FakeResponse(next(states)),
     )
+    monkeypatch.setattr("inkling_serving_benchmark.time.sleep", lambda seconds: None)
+
+    wait_for_server_idle("http://server", poll_seconds=0.0)
+
+
+def test_wait_for_server_idle_retries_transient_poll_failure(monkeypatch) -> None:
+    responses = iter(
+        [
+            requests.Timeout("temporary"),
+            {
+                "internal_states": [
+                    {
+                        "running_batch_size": 0,
+                        "waiting_queue_size": 0,
+                        "req_to_token_pool_used": 0,
+                    }
+                ]
+            },
+        ]
+    )
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return self.payload
+
+    def fake_get(url, timeout):
+        response = next(responses)
+        if isinstance(response, Exception):
+            raise response
+        return FakeResponse(response)
+
+    monkeypatch.setattr("inkling_serving_benchmark.requests.get", fake_get)
     monkeypatch.setattr("inkling_serving_benchmark.time.sleep", lambda seconds: None)
 
     wait_for_server_idle("http://server", poll_seconds=0.0)
@@ -222,9 +299,9 @@ def test_slot_output_signature_follows_internal_slot_not_submission_order() -> N
     first = make_request(4, "alpha")
     second = make_request(2, "beta")
 
-    assert slot_output_signature({"requests": [first, second]}) == slot_output_signature(
-        {"requests": [second, first]}
-    )
+    assert slot_output_signature(
+        {"requests": [first, second]}
+    ) == slot_output_signature({"requests": [second, first]})
 
 
 def test_summary_rejects_group_without_fully_active_interval() -> None:
