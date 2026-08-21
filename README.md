@@ -3,13 +3,6 @@
 This repository is our working implementation and benchmark suite for running
 Inkling-Small on TPU7x with SGLang-JAX and DSpark speculative decoding.
 
-The project is paused as of August 21, 2026. The serving path on `main` is the
-known-good version. This research session did not find another throughput change
-worth keeping.
-
-`main` also contains optional routed-expert quantization wiring. We have not
-measured a serving-speed gain from that path.
-
 ## What works
 
 - Inkling-Small target inference on eight TPU7x devices.
@@ -78,9 +71,6 @@ counter. They cannot support trustworthy utilization or bandwidth rates.
   existing c48 path.
 - **Context window 512:** slower than the current 256-token DSpark context.
 - **Proposal widths below eight:** K8 remained best.
-
-Do not reopen these ideas unless the implementation or hardware primitive has
-materially changed.
 
 ## What would be worth doing next
 
