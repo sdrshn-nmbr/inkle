@@ -15,6 +15,7 @@ from safetensors.numpy import save_file
 
 from sgl_jax.srt.configs.inkling import InklingConfig, InklingTextConfig
 from sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.configs.quantization_config import QuantizationConfig
 from sgl_jax.srt.layers.attention.native_backend import compact_page_aligned_cache_loc
 from sgl_jax.srt.layers.attention.native_backend import relative_position_bias
 from sgl_jax.srt.layers.attention.native_backend import NativeAttention
@@ -377,6 +378,32 @@ class TestInklingModel(unittest.TestCase):
             jax.nn.silu(jnp.asarray(gate_up[:, 0::2])) * jnp.asarray(gate_up[:, 1::2])
         ) @ jnp.asarray(down)
         np.testing.assert_allclose(actual, np.asarray(expected) * 0.75, rtol=1e-6, atol=1e-6)
+
+    def test_routed_experts_receive_root_quantization_config(self):
+        root_config = make_config()
+        root_config.quantization_config = QuantizationConfig(
+            linear_rules=[{"module_path": "(?!)", "weight_dtype": "float8_e4m3fn"}],
+            moe_weight_dtype=jnp.float8_e4m3fn,
+            moe_activation_dtype=None,
+        )
+
+        moe = InklingMoE(
+            root_config.text_config,
+            root_config,
+            2,
+            MESH,
+            jnp.bfloat16,
+        )
+
+        self.assertEqual(moe.experts.quantized_dtype, jnp.float8_e4m3fn)
+        self.assertIsNone(moe.experts.activation_quantized_dtype)
+        moe.experts.quantize_weights()
+        self.assertEqual(moe.experts.wi_0.value.dtype, jnp.float8_e4m3fn)
+        self.assertEqual(moe.experts.wi_1.value.dtype, jnp.float8_e4m3fn)
+        self.assertEqual(moe.experts.wo.value.dtype, jnp.float8_e4m3fn)
+        self.assertEqual(moe.experts.wi_0_scale.value.shape, (8, 1, 1, 8))
+        self.assertEqual(moe.experts.wi_1_scale.value.shape, (8, 1, 1, 8))
+        self.assertEqual(moe.experts.wo_scale.value.shape, (8, 1, 1, 32))
 
     def test_router_jointly_normalizes_routed_and_shared_experts(self):
         config = make_config().text_config

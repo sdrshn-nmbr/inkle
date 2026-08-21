@@ -395,6 +395,7 @@ class InklingMoE(nnx.Module):
             activation="silu",
             layer_id=layer_id,
             preferred_element_type=jnp.float32,
+            quantization_config=getattr(root_config, "quantization_config", None),
         )
         self.shared_experts = InklingSharedExperts(
             hidden_size=config.hidden_size,
