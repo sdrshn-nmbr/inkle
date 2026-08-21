@@ -2,13 +2,19 @@ import argparse
 import concurrent.futures
 import hashlib
 import json
+import os
+import platform
 import statistics
+import subprocess
+import sys
 import threading
 import time
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
 import requests
+import tiktoken
 
 
 def parse_args() -> argparse.Namespace:
@@ -20,11 +26,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repetitions", type=int, default=5)
     parser.add_argument("--concurrency", type=int, nargs="+", default=[1, 4, 8, 16])
     parser.add_argument(
+        "--request-timeout-seconds",
+        type=float,
+        default=900.0,
+        help="Maximum wall time for each streaming generation request.",
+    )
+    parser.add_argument(
         "--request-mode",
         choices=("concurrent", "batch"),
         default="concurrent",
     )
     parser.add_argument("--input-ids", type=int, nargs="+")
+    parser.add_argument(
+        "--prompt-cases",
+        type=Path,
+        help="JSON prompt corpus with stable IDs and explicit input token IDs.",
+    )
+    parser.add_argument(
+        "--workload",
+        choices=("custom", "aa-1k", "aa-10k", "aa-100k", "aa-parallel-1k"),
+        default="custom",
+    )
+    parser.add_argument(
+        "--standard-tokenizer",
+        default="o200k_base",
+        help="Tiktoken encoding used for provider-comparable output counts.",
+    )
     parser.add_argument("--ignore-eos", action="store_true")
     parser.add_argument(
         "--atomic-admission-delay-seconds",
@@ -42,7 +69,179 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
     )
+    parser.add_argument(
+        "--require-fully-active",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Require a contiguous interval where every submitted request is "
+            "simultaneously decoding. Disable for provider-style latency runs."
+        ),
+    )
     return parser.parse_args()
+
+
+WORKLOAD_CONTRACTS = {
+    "aa-1k": {"input_tokens": 1_000, "minimum_output_tokens": 1_000},
+    "aa-10k": {"input_tokens": 10_000, "minimum_output_tokens": 1_500},
+    "aa-100k": {"input_tokens": 100_000, "minimum_output_tokens": 2_000},
+    "aa-parallel-1k": {
+        "input_tokens": 1_000,
+        "minimum_output_tokens": 1_000,
+        "required_concurrency": 10,
+    },
+}
+
+
+def sha256_json(value: object) -> str:
+    encoded = json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def compact_request_body(request_body: dict[str, object]) -> dict[str, object]:
+    compact = dict(request_body)
+    input_ids = compact.pop("input_ids", None)
+    if input_ids is not None:
+        compact["input_ids_count"] = len(input_ids)
+        compact["input_ids_sha256"] = sha256_json(input_ids)
+    return compact
+
+
+def load_prompt_cases(path: Path) -> list[dict[str, object]]:
+    payload = json.loads(path.read_text())
+    if not isinstance(payload, list) or not payload:
+        raise ValueError("Prompt cases must be a non-empty JSON list")
+    cases = []
+    for index, case in enumerate(payload):
+        if not isinstance(case, dict):
+            raise ValueError(f"Prompt case {index} must be an object")
+        case_id = case.get("id")
+        input_ids = case.get("input_ids")
+        if not isinstance(case_id, str) or not case_id:
+            raise ValueError(f"Prompt case {index} needs a non-empty string ID")
+        if (
+            not isinstance(input_ids, list)
+            or not input_ids
+            or any(not isinstance(token_id, int) for token_id in input_ids)
+        ):
+            raise ValueError(f"Prompt case {case_id} needs integer input_ids")
+        cases.append(dict(case))
+    if len({case["id"] for case in cases}) != len(cases):
+        raise ValueError("Prompt case IDs must be unique")
+    return cases
+
+
+def validate_workload(
+    workload: str,
+    prompt_cases: list[dict[str, object]] | None,
+    output_tokens: int,
+    concurrency: list[int],
+    repetitions: int,
+) -> None:
+    required_prompt_cases = repetitions * sum(concurrency)
+    if prompt_cases is not None and len(prompt_cases) < required_prompt_cases:
+        raise ValueError(
+            "Prompt corpus cannot provide a unique prompt for every request "
+            f"required={required_prompt_cases} available={len(prompt_cases)}"
+        )
+    if workload == "custom":
+        return
+    if prompt_cases is None:
+        raise ValueError(f"{workload} requires --prompt-cases")
+    contract = WORKLOAD_CONTRACTS[workload]
+    expected_tokens = int(contract["input_tokens"])
+    wrong_lengths = {
+        str(case["id"]): len(case["input_ids"])
+        for case in prompt_cases
+        if len(case["input_ids"]) != expected_tokens
+    }
+    if wrong_lengths:
+        raise ValueError(
+            f"{workload} requires exactly {expected_tokens} input tokens: "
+            f"{wrong_lengths}"
+        )
+    minimum_output_tokens = int(contract["minimum_output_tokens"])
+    if output_tokens < minimum_output_tokens:
+        raise ValueError(
+            f"{workload} requires at least {minimum_output_tokens} output tokens"
+        )
+    required_concurrency = contract.get("required_concurrency")
+    if required_concurrency is not None and concurrency != [required_concurrency]:
+        raise ValueError(
+            f"{workload} requires --concurrency {required_concurrency}"
+        )
+
+
+def select_prompt_cases(
+    prompt_cases: list[dict[str, object]], concurrency: int, offset: int
+) -> list[dict[str, object]]:
+    return prompt_cases[offset : offset + concurrency]
+
+
+def run_text(command: list[str]) -> str | None:
+    completed = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return completed.stdout.strip() if completed.returncode == 0 else None
+
+
+def collect_provenance(
+    args: argparse.Namespace,
+    prompt_cases: list[dict[str, object]] | None,
+) -> dict[str, object]:
+    source_path = Path(__file__).resolve()
+    server_info_response = requests.get(f"{args.url}/get_server_info", timeout=30)
+    server_info_response.raise_for_status()
+    return {
+        "captured_at_utc": datetime.now(UTC).isoformat(),
+        "command": sys.argv,
+        "benchmark_source": str(source_path),
+        "benchmark_source_sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
+        "git_commit": run_text(["git", "rev-parse", "HEAD"]),
+        "git_status_porcelain": run_text(["git", "status", "--short"]),
+        "hostname": platform.node(),
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "runtime_environment": {
+            name: os.environ[name]
+            for name in ("JAX_PLATFORM_NAME", "LIBTPU_INIT_ARGS", "XLA_FLAGS")
+            if name in os.environ
+        },
+        "server_info": server_info_response.json(),
+        "workload": args.workload,
+        "output_tokens": args.output_tokens,
+        "concurrency": args.concurrency,
+        "repetitions": args.repetitions,
+        "request_timeout_seconds": args.request_timeout_seconds,
+        "request_mode": args.request_mode,
+        "ignore_eos": args.ignore_eos,
+        "require_fully_active": args.require_fully_active,
+        "standard_tokenizer": args.standard_tokenizer,
+        "prompt_cases_path": (
+            str(args.prompt_cases.resolve()) if args.prompt_cases else None
+        ),
+        "prompt_cases_sha256": sha256_json(prompt_cases),
+        "prompt_case_count": len(prompt_cases) if prompt_cases is not None else None,
+        "native_input_token_counts": (
+            sorted({len(case["input_ids"]) for case in prompt_cases})
+            if prompt_cases is not None
+            else None
+        ),
+        "standard_input_token_counts": (
+            sorted(
+                {
+                    int(case["standard_input_tokens"])
+                    for case in prompt_cases
+                    if case.get("standard_input_tokens") is not None
+                }
+            )
+            if prompt_cases is not None
+            else None
+        ),
+    }
 
 
 def stream_request(
@@ -55,6 +254,7 @@ def stream_request(
     return_routed_experts: bool,
     stop_after_first_completion: bool = False,
     stop_event: threading.Event | None = None,
+    request_timeout_seconds: float = 900.0,
 ) -> dict[str, object]:
     request_body = {
         "rid": uuid.uuid4().hex,
@@ -77,7 +277,7 @@ def stream_request(
         f"{url}/generate",
         json=request_body,
         stream=True,
-        timeout=900,
+        timeout=request_timeout_seconds,
     ) as response:
         response.raise_for_status()
         for line in response.iter_lines():
@@ -125,7 +325,7 @@ def stream_request(
         "chunks": chunks,
         "e2e_ms": (end_ns - start_ns) / 1e6,
         "inter_token_ms": inter_token_ms,
-        "request": request_body,
+        "request": compact_request_body(request_body),
         "time_to_first_token_ms": first_ms,
     }
 
@@ -170,7 +370,14 @@ def run_group(
     return_routed_experts: bool,
     atomic_admission_delay_seconds: float = 0.0,
     stop_after_first_completion: bool = False,
+    prompt_cases: list[dict[str, object]] | None = None,
+    request_timeout_seconds: float = 900.0,
 ) -> dict[str, object]:
+    if prompt_cases is not None and len(prompt_cases) != concurrency:
+        raise ValueError(
+            "The selected prompt case count must equal concurrency "
+            f"cases={len(prompt_cases)} concurrency={concurrency}"
+        )
     if atomic_admission_delay_seconds > 0:
         pause_response = requests.post(
             f"{url}/pause_generation",
@@ -183,16 +390,18 @@ def run_group(
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                 future = executor.submit(
                     run_group,
-                    url,
-                    prompt,
-                    output_tokens,
-                    concurrency,
-                    request_mode,
-                    input_ids,
-                    ignore_eos,
-                    return_routed_experts,
-                    0.0,
-                    stop_after_first_completion,
+                    url=url,
+                    prompt=prompt,
+                    output_tokens=output_tokens,
+                    concurrency=concurrency,
+                    request_mode=request_mode,
+                    input_ids=input_ids,
+                    ignore_eos=ignore_eos,
+                    return_routed_experts=return_routed_experts,
+                    atomic_admission_delay_seconds=0.0,
+                    stop_after_first_completion=stop_after_first_completion,
+                    prompt_cases=prompt_cases,
+                    request_timeout_seconds=request_timeout_seconds,
                 )
                 time.sleep(atomic_admission_delay_seconds)
                 continue_response = requests.post(
@@ -223,29 +432,41 @@ def run_group(
             input_ids,
             ignore_eos,
             return_routed_experts,
+            prompt_cases,
+            request_timeout_seconds,
         )
 
     start_barrier = threading.Barrier(concurrency + 1)
     stop_event = threading.Event()
     with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
-        futures = [
-            executor.submit(
-                stream_request,
-                url,
-                prompt,
-                input_ids,
-                output_tokens,
-                start_barrier,
-                ignore_eos,
-                return_routed_experts,
-                stop_after_first_completion,
-                stop_event,
+        futures = []
+        for index in range(concurrency):
+            case = prompt_cases[index] if prompt_cases is not None else None
+            request_input_ids = case["input_ids"] if case is not None else input_ids
+            futures.append(
+                executor.submit(
+                    stream_request,
+                    url,
+                    prompt,
+                    request_input_ids,
+                    output_tokens,
+                    start_barrier,
+                    ignore_eos,
+                    return_routed_experts,
+                    stop_after_first_completion,
+                    stop_event,
+                    request_timeout_seconds,
+                )
             )
-            for _ in range(concurrency)
-        ]
         start_barrier.wait()
         group_start_ns = time.perf_counter_ns()
         requests_out = [future.result() for future in futures]
+    if prompt_cases is not None:
+        for request, case in zip(requests_out, prompt_cases, strict=True):
+            request["prompt_case_id"] = case["id"]
+            request["native_input_tokens"] = len(case["input_ids"])
+            request["standard_input_tokens"] = case.get("standard_input_tokens")
+            request["decoded_prompt_sha256"] = case.get("decoded_text_sha256")
     if stop_after_first_completion:
         wait_for_server_idle(url)
     group_ms = (time.perf_counter_ns() - group_start_ns) / 1e6
@@ -272,6 +493,8 @@ def run_batch_group(
     input_ids: list[int] | None,
     ignore_eos: bool,
     return_routed_experts: bool,
+    prompt_cases: list[dict[str, object]] | None = None,
+    request_timeout_seconds: float = 900.0,
 ) -> dict[str, object]:
     request_body = {
         "rid": [uuid.uuid4().hex for _ in range(concurrency)],
@@ -283,7 +506,9 @@ def run_batch_group(
         "stream": True,
         "return_routed_experts": return_routed_experts,
     }
-    if input_ids is None:
+    if prompt_cases is not None:
+        request_body["input_ids"] = [case["input_ids"] for case in prompt_cases]
+    elif input_ids is None:
         request_body["text"] = [prompt] * concurrency
     else:
         request_body["input_ids"] = [input_ids] * concurrency
@@ -293,7 +518,7 @@ def run_batch_group(
         f"{url}/generate",
         json=request_body,
         stream=True,
-        timeout=900,
+        timeout=request_timeout_seconds,
     ) as response:
         response.raise_for_status()
         for line in response.iter_lines():
@@ -304,14 +529,15 @@ def run_batch_group(
                 break
             elapsed_ms = (time.perf_counter_ns() - start_ns) / 1e6
             output = json.loads(payload)
-            request_chunks = chunks_by_request[output.pop("index")]
+            request_index = output.pop("index")
+            request_chunks = chunks_by_request[request_index]
             compact_previous_chunk(request_chunks)
             request_chunks.append(
                 {"elapsed_ms": elapsed_ms, "response": output}
             )
     end_ns = time.perf_counter_ns()
     requests_out = []
-    for chunks in chunks_by_request:
+    for index, chunks in enumerate(chunks_by_request):
         arrival_ms = [chunk["elapsed_ms"] for chunk in chunks]
         requests_out.append(
             {
@@ -324,7 +550,35 @@ def run_batch_group(
                         arrival_ms, arrival_ms[1:], strict=False
                     )
                 ],
-                "request": request_body,
+                "request": compact_request_body(
+                    {
+                        **request_body,
+                        "rid": request_body["rid"][index],
+                        **(
+                            {"input_ids": request_body["input_ids"][index]}
+                            if "input_ids" in request_body
+                            else {"text": request_body["text"][index]}
+                        ),
+                    }
+                ),
+                "prompt_case_id": (
+                    prompt_cases[index]["id"] if prompt_cases is not None else None
+                ),
+                "native_input_tokens": (
+                    len(prompt_cases[index]["input_ids"])
+                    if prompt_cases is not None
+                    else None
+                ),
+                "standard_input_tokens": (
+                    prompt_cases[index].get("standard_input_tokens")
+                    if prompt_cases is not None
+                    else None
+                ),
+                "decoded_prompt_sha256": (
+                    prompt_cases[index].get("decoded_text_sha256")
+                    if prompt_cases is not None
+                    else None
+                ),
                 "time_to_first_token_ms": arrival_ms[0] if arrival_ms else None,
             }
         )
@@ -344,7 +598,12 @@ def run_batch_group(
     }
 
 
-def summarize(groups: list[dict[str, object]]) -> dict[str, object]:
+def summarize(
+    groups: list[dict[str, object]],
+    *,
+    require_fully_active: bool = True,
+    comparable_outputs: bool = True,
+) -> dict[str, object]:
     by_concurrency = {}
     for concurrency in sorted({group["concurrency"] for group in groups}):
         selected = [group for group in groups if group["concurrency"] == concurrency]
@@ -366,6 +625,8 @@ def summarize(groups: list[dict[str, object]]) -> dict[str, object]:
             try:
                 full_batch_metrics.append(fully_active_metrics(group))
             except ValueError as error:
+                if not require_fully_active:
+                    continue
                 repetition = group.get("repetition", "unknown")
                 raise ValueError(
                     f"concurrency {concurrency} never became fully active in "
@@ -377,8 +638,26 @@ def summarize(groups: list[dict[str, object]]) -> dict[str, object]:
             for request in group["requests"]
             for delta in request["completion_token_deltas"]
         ]
+        native_output_speeds = [
+            speed
+            for group in selected
+            for request in group["requests"]
+            if (speed := output_speed_after_first_token(request)) is not None
+        ]
+        standard_output_speeds = [
+            float(request["standard_output_speed_after_first_token"])
+            for group in selected
+            for request in group["requests"]
+            if request.get("standard_output_speed_after_first_token") is not None
+        ]
         output_signatures = [output_multiset_signature(group) for group in selected]
         slot_output_signatures = [slot_output_signature(group) for group in selected]
+        observed_batch_sizes = [
+            int(chunk["response"]["meta_info"]["server_batch_size"])
+            for group in selected
+            for request in group["requests"]
+            for chunk in request["chunks"]
+        ]
         by_concurrency[str(concurrency)] = {
             "e2e_median_ms": statistics.median(e2e),
             "e2e_p95_ms": percentile(e2e, 0.95),
@@ -389,7 +668,31 @@ def summarize(groups: list[dict[str, object]]) -> dict[str, object]:
             "throughput_median_tokens_per_second": statistics.median(
                 group["throughput_tokens_per_second"] for group in selected
             ),
+            "standard_throughput_median_tokens_per_second": statistics.median(
+                group["standard_throughput_tokens_per_second"]
+                for group in selected
+            ),
             "time_to_first_token_median_ms": statistics.median(ttft) if ttft else None,
+            "per_request_output_speed_median_tokens_per_second": (
+                statistics.median(native_output_speeds)
+                if native_output_speeds
+                else None
+            ),
+            "per_request_output_speed_p10_tokens_per_second": (
+                percentile(native_output_speeds, 0.10)
+                if native_output_speeds
+                else None
+            ),
+            "per_request_output_speed_p90_tokens_per_second": (
+                percentile(native_output_speeds, 0.90)
+                if native_output_speeds
+                else None
+            ),
+            "standard_per_request_output_speed_median_tokens_per_second": (
+                statistics.median(standard_output_speeds)
+                if standard_output_speeds
+                else None
+            ),
             "fully_active_model_step_median_ms": (
                 statistics.median(
                     metrics["model_step_median_ms"] for metrics in full_batch_metrics
@@ -405,14 +708,19 @@ def summarize(groups: list[dict[str, object]]) -> dict[str, object]:
                 if full_batch_metrics
                 else None
             ),
-            "server_full_batch_observed": all(
-                metrics["server_full_batch_observed"] for metrics in full_batch_metrics
+            "server_full_batch_observed": len(full_batch_metrics) == len(selected),
+            "fully_active_repetitions": len(full_batch_metrics),
+            "max_server_batch_size": (
+                max(observed_batch_sizes) if observed_batch_sizes else 0
             ),
-            "max_server_batch_size": max(
-                metrics["max_server_batch_size"] for metrics in full_batch_metrics
+            "output_multiset_stable": (
+                len(set(output_signatures)) == 1 if comparable_outputs else None
             ),
-            "output_multiset_stable": len(set(output_signatures)) == 1,
-            "slot_output_mapping_stable": len(set(slot_output_signatures)) == 1,
+            "slot_output_mapping_stable": (
+                len(set(slot_output_signatures)) == 1
+                if comparable_outputs
+                else None
+            ),
             "request_state_slots": sorted(
                 {
                     request_state_slot(request)
@@ -431,6 +739,51 @@ def summarize(groups: list[dict[str, object]]) -> dict[str, object]:
             ),
         }
     return by_concurrency
+
+
+def output_speed_after_first_token(request: dict[str, object]) -> float | None:
+    chunks = request["chunks"]
+    if len(chunks) < 2:
+        return None
+    first = chunks[0]
+    last = chunks[-1]
+    elapsed_ms = float(last["elapsed_ms"]) - float(first["elapsed_ms"])
+    last_tokens = int(last["response"]["meta_info"]["completion_tokens"])
+    measured_tokens = last_tokens - 1
+    if elapsed_ms <= 0 or measured_tokens <= 0:
+        return None
+    return measured_tokens * 1000 / elapsed_ms
+
+
+def annotate_standard_token_counts(
+    group: dict[str, object], encoding: tiktoken.Encoding
+) -> None:
+    for request in group["requests"]:
+        chunks = request["chunks"]
+        if not chunks:
+            continue
+        request["output_speed_after_first_token"] = output_speed_after_first_token(
+            request
+        )
+        final_text = chunks[-1]["response"].get("text", "")
+        standard_tokens = len(encoding.encode(final_text))
+        request["standard_completion_tokens"] = standard_tokens
+        elapsed_ms = float(chunks[-1]["elapsed_ms"]) - float(
+            chunks[0]["elapsed_ms"]
+        )
+        measured_tokens = standard_tokens - 1
+        request["standard_output_speed_after_first_token"] = (
+            measured_tokens * 1000 / elapsed_ms
+            if elapsed_ms > 0 and measured_tokens > 0
+            else None
+        )
+    group["standard_total_completion_tokens"] = sum(
+        int(request.get("standard_completion_tokens", 0))
+        for request in group["requests"]
+    )
+    group["standard_throughput_tokens_per_second"] = (
+        group["standard_total_completion_tokens"] * 1000 / float(group["group_ms"])
+    )
 
 
 def percentile(values: list[float], fraction: float) -> float:
@@ -589,27 +942,54 @@ def slot_output_signature(group: dict[str, object]) -> tuple[tuple[int, int, str
 
 def main() -> None:
     args = parse_args()
+    if args.prompt_cases is not None and args.input_ids is not None:
+        raise ValueError("Use either --prompt-cases or --input-ids, not both")
+    prompt_cases = load_prompt_cases(args.prompt_cases) if args.prompt_cases else None
+    validate_workload(
+        args.workload,
+        prompt_cases,
+        args.output_tokens,
+        args.concurrency,
+        args.repetitions,
+    )
+    standard_encoding = tiktoken.get_encoding(args.standard_tokenizer)
     args.output_directory.mkdir(parents=True, exist_ok=True)
+    provenance = collect_provenance(args, prompt_cases)
     groups = []
+    prompt_case_offset = 0
     for concurrency in args.concurrency:
         for repetition in range(args.repetitions):
-            group = run_group(
-                args.url,
-                args.prompt,
-                args.output_tokens,
-                concurrency,
-                args.request_mode,
-                args.input_ids,
-                args.ignore_eos,
-                args.return_routed_experts,
-                args.atomic_admission_delay_seconds,
-                args.stop_after_first_completion,
+            selected_cases = (
+                select_prompt_cases(prompt_cases, concurrency, prompt_case_offset)
+                if prompt_cases is not None
+                else None
             )
+            prompt_case_offset += concurrency
+            group = run_group(
+                url=args.url,
+                prompt=args.prompt,
+                output_tokens=args.output_tokens,
+                concurrency=concurrency,
+                request_mode=args.request_mode,
+                input_ids=args.input_ids,
+                ignore_eos=args.ignore_eos,
+                return_routed_experts=args.return_routed_experts,
+                atomic_admission_delay_seconds=args.atomic_admission_delay_seconds,
+                stop_after_first_completion=args.stop_after_first_completion,
+                prompt_cases=selected_cases,
+                request_timeout_seconds=args.request_timeout_seconds,
+            )
+            annotate_standard_token_counts(group, standard_encoding)
             group["repetition"] = repetition
             groups.append(group)
             checkpoint = {
                 "groups": groups,
-                "summary": summarize(groups),
+                "provenance": provenance,
+                "summary": summarize(
+                    groups,
+                    require_fully_active=args.require_fully_active,
+                    comparable_outputs=prompt_cases is None,
+                ),
             }
             (args.output_directory / "serving-benchmark.partial.json").write_text(
                 json.dumps(checkpoint, indent=2, sort_keys=True)
@@ -630,7 +1010,12 @@ def main() -> None:
 
     result = {
         "groups": groups,
-        "summary": summarize(groups),
+        "provenance": provenance,
+        "summary": summarize(
+            groups,
+            require_fully_active=args.require_fully_active,
+            comparable_outputs=prompt_cases is None,
+        ),
     }
     (args.output_directory / "serving-benchmark.json").write_text(
         json.dumps(result, indent=2, sort_keys=True)

@@ -1,8 +1,13 @@
 import argparse
 import contextlib
+import hashlib
 import json
+import platform
+import subprocess
+import sys
 import time
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
 import requests
@@ -16,8 +21,53 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--concurrency", type=int, default=32)
     parser.add_argument("--output-tokens", type=int, default=256)
     parser.add_argument("--captured-steps", type=int, default=64)
+    parser.add_argument("--host-tracer-level", type=int, default=0)
+    parser.add_argument("--python-tracer-level", type=int, default=0)
     parser.add_argument("--prompt", default="Write an essay on vmap in JAX.")
+    parser.add_argument(
+        "--prompt-cases",
+        type=Path,
+        help="JSON prompt corpus with stable IDs and exact input token IDs.",
+    )
     return parser.parse_args()
+
+
+def sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def load_profile_prompt_cases(
+    path: Path, concurrency: int
+) -> list[dict[str, object]]:
+    payload = json.loads(path.read_text())
+    if not isinstance(payload, list) or len(payload) < concurrency:
+        raise ValueError(
+            "PROFILE_PROMPT_CORPUS_TOO_SMALL "
+            f"required={concurrency} available={len(payload) if isinstance(payload, list) else 0}"
+        )
+    selected = payload[:concurrency]
+    for index, case in enumerate(selected):
+        if (
+            not isinstance(case, dict)
+            or not isinstance(case.get("id"), str)
+            or not isinstance(case.get("input_ids"), list)
+            or not case["input_ids"]
+            or any(not isinstance(token_id, int) for token_id in case["input_ids"])
+        ):
+            raise ValueError(f"PROFILE_PROMPT_CASE_INVALID index={index}")
+    if len({case["id"] for case in selected}) != concurrency:
+        raise ValueError("PROFILE_PROMPT_CASE_IDS_NOT_UNIQUE")
+    return selected
+
+
+def run_text(command: list[str]) -> str | None:
+    completed = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return completed.stdout.strip() if completed.returncode == 0 else None
 
 
 def post_profile(url: str, endpoint: str, body: dict | None = None) -> dict:
@@ -34,9 +84,13 @@ def run_profile(args: argparse.Namespace) -> dict[str, object]:
     if args.captured_steps >= args.output_tokens:
         raise ValueError("captured steps must be smaller than output tokens")
 
+    prompt_cases = (
+        load_profile_prompt_cases(args.prompt_cases, args.concurrency)
+        if args.prompt_cases is not None
+        else None
+    )
     request_body = {
         "rid": [uuid.uuid4().hex for _ in range(args.concurrency)],
-        "text": [args.prompt] * args.concurrency,
         "sampling_params": {
             "temperature": 0,
             "max_new_tokens": args.output_tokens,
@@ -45,6 +99,10 @@ def run_profile(args: argparse.Namespace) -> dict[str, object]:
         "stream": True,
         "return_routed_experts": False,
     }
+    if prompt_cases is None:
+        request_body["text"] = [args.prompt] * args.concurrency
+    else:
+        request_body["input_ids"] = [case["input_ids"] for case in prompt_cases]
     first_seen = set()
     chunks_by_request = [[] for _ in range(args.concurrency)]
     profile_started = False
@@ -58,7 +116,7 @@ def run_profile(args: argparse.Namespace) -> dict[str, object]:
             f"{args.url}/generate",
             json=request_body,
             stream=True,
-            timeout=600,
+            timeout=3600,
         ) as response:
             response.raise_for_status()
             for line in response.iter_lines():
@@ -81,8 +139,8 @@ def run_profile(args: argparse.Namespace) -> dict[str, object]:
                         "start_profile",
                         {
                             "output_dir": args.profile_directory,
-                            "host_tracer_level": 0,
-                            "python_tracer_level": 0,
+                            "host_tracer_level": args.host_tracer_level,
+                            "python_tracer_level": args.python_tracer_level,
                         },
                     )
                     profile_started = True
@@ -105,13 +163,53 @@ def run_profile(args: argparse.Namespace) -> dict[str, object]:
         post_profile(args.url, "stop_profile")
         raise RuntimeError("PROFILE_NEVER_STOPPED request ended before capture completed")
 
+    source_path = Path(__file__).resolve()
+    server_info_response = requests.get(f"{args.url}/get_server_info", timeout=30)
+    server_info_response.raise_for_status()
+    request_receipt = {
+        key: value for key, value in request_body.items() if key != "input_ids"
+    }
+    if prompt_cases is not None:
+        request_receipt["prompt_cases"] = [
+            {
+                "id": case["id"],
+                "native_input_tokens": len(case["input_ids"]),
+                "input_ids_sha256": sha256_bytes(
+                    json.dumps(case["input_ids"], separators=(",", ":")).encode()
+                ),
+                "standard_input_tokens": case.get("standard_input_tokens"),
+                "decoded_prompt_sha256": case.get("decoded_text_sha256"),
+            }
+            for case in prompt_cases
+        ]
     return {
-        "request": request_body,
+        "request": request_receipt,
+        "provenance": {
+            "captured_at_utc": datetime.now(UTC).isoformat(),
+            "command": sys.argv,
+            "benchmark_source": str(source_path),
+            "benchmark_source_sha256": sha256_bytes(source_path.read_bytes()),
+            "git_commit": run_text(["git", "rev-parse", "HEAD"]),
+            "git_status_porcelain": run_text(["git", "status", "--short"]),
+            "hostname": platform.node(),
+            "python": platform.python_version(),
+            "server_info": server_info_response.json(),
+            "prompt_cases_path": (
+                str(args.prompt_cases.resolve()) if args.prompt_cases else None
+            ),
+            "prompt_cases_file_sha256": (
+                sha256_bytes(args.prompt_cases.read_bytes())
+                if args.prompt_cases
+                else None
+            ),
+        },
         "profile_start_response": profile_start_response,
         "profile_stop_response": profile_stop_response,
         "profile_start_condition": "every request emitted at least one token",
         "admissions_during_capture": 0,
         "captured_steps_after_first_token": args.captured_steps,
+        "host_tracer_level": args.host_tracer_level,
+        "python_tracer_level": args.python_tracer_level,
         "elapsed_ms": (time.perf_counter_ns() - start_ns) / 1e6,
         "chunks_by_request": chunks_by_request,
     }

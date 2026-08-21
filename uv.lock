@@ -937,6 +937,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "sglang-jax" },
+    { name = "tiktoken" },
 ]
 
 [package.optional-dependencies]
@@ -957,6 +958,7 @@ dev = [
 requires-dist = [
     { name = "sglang-jax", editable = "engine/sglang-jax/python" },
     { name = "sglang-jax", extras = ["tpu"], marker = "extra == 'tpu'", editable = "engine/sglang-jax/python" },
+    { name = "tiktoken", specifier = ">=0.13.0" },
     { name = "xprof", marker = "extra == 'profile'", specifier = ">=2.23,<3" },
 ]
 provides-extras = ["profile", "tpu"]

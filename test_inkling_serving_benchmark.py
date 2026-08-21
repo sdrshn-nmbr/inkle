@@ -1,11 +1,15 @@
 import sys
 import threading
+from pathlib import Path
 
 import pytest
 import requests
 
 from inkling_serving_benchmark import (
+    compact_request_body,
     fully_active_metrics,
+    load_prompt_cases,
+    output_speed_after_first_token,
     parse_args,
     percentile,
     request_recurrent_state_slot,
@@ -13,8 +17,101 @@ from inkling_serving_benchmark import (
     slot_output_signature,
     stream_request,
     summarize,
+    validate_workload,
     wait_for_server_idle,
 )
+
+
+def test_output_speed_starts_after_first_streamed_token() -> None:
+    request = {
+        "chunks": [
+            {
+                "elapsed_ms": 100.0,
+                "response": {"meta_info": {"completion_tokens": 2}},
+            },
+            {
+                "elapsed_ms": 300.0,
+                "response": {"meta_info": {"completion_tokens": 10}},
+            },
+        ]
+    }
+
+    assert output_speed_after_first_token(request) == pytest.approx(45.0)
+
+
+def test_output_speed_requires_tokens_after_first_token() -> None:
+    request = {
+        "chunks": [
+            {
+                "elapsed_ms": 100.0,
+                "response": {"meta_info": {"completion_tokens": 2}},
+            }
+        ]
+    }
+
+    assert output_speed_after_first_token(request) is None
+
+
+def test_compact_request_body_hashes_input_ids() -> None:
+    compact = compact_request_body(
+        {
+            "rid": "request-id",
+            "input_ids": [11, 22, 33],
+            "sampling_params": {"temperature": 0},
+        }
+    )
+
+    assert compact == {
+        "rid": "request-id",
+        "input_ids_count": 3,
+        "input_ids_sha256": (
+            "3cf46ba3daf30bf336dbbc80c5f3fd4185bf9cc3747b7ce49d58335723d3a72c"
+        ),
+        "sampling_params": {"temperature": 0},
+    }
+
+
+def test_load_prompt_cases_accepts_explicit_ids(tmp_path: Path) -> None:
+    path = tmp_path / "prompts.json"
+    path.write_text(
+        '[{"id":"alpha","input_ids":[1,2]},'
+        '{"id":"beta","input_ids":[3,4]}]'
+    )
+
+    assert load_prompt_cases(path) == [
+        {"id": "alpha", "input_ids": [1, 2]},
+        {"id": "beta", "input_ids": [3, 4]},
+    ]
+
+
+def test_load_prompt_cases_rejects_duplicate_ids(tmp_path: Path) -> None:
+    path = tmp_path / "prompts.json"
+    path.write_text(
+        '[{"id":"same","input_ids":[1]},'
+        '{"id":"same","input_ids":[2]}]'
+    )
+
+    with pytest.raises(ValueError, match="Prompt case IDs must be unique"):
+        load_prompt_cases(path)
+
+
+def test_aa_workload_enforces_prompt_and_output_lengths() -> None:
+    prompt_cases = [{"id": "prompt", "input_ids": list(range(1_000))}]
+
+    validate_workload("aa-1k", prompt_cases, 1_000, [1], 1)
+
+    with pytest.raises(ValueError, match="at least 1000 output tokens"):
+        validate_workload("aa-1k", prompt_cases, 999, [1], 1)
+
+
+def test_parallel_workload_requires_ten_concurrent_prompts() -> None:
+    prompt_cases = [
+        {"id": f"prompt-{index}", "input_ids": list(range(1_000))}
+        for index in range(11)
+    ]
+
+    with pytest.raises(ValueError, match="requires --concurrency 10"):
+        validate_workload("aa-parallel-1k", prompt_cases, 1_000, [1, 10], 1)
 
 
 def test_benchmark_does_not_request_unconfigured_expert_capture_by_default(
@@ -27,6 +124,22 @@ def test_benchmark_does_not_request_unconfigured_expert_capture_by_default(
     )
 
     assert not parse_args().return_routed_experts
+
+
+def test_benchmark_accepts_long_streaming_request_timeout(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "inkling_serving_benchmark.py",
+            "--output-directory",
+            str(tmp_path),
+            "--request-timeout-seconds",
+            "3600",
+        ],
+    )
+
+    assert parse_args().request_timeout_seconds == 3600
 
 
 def test_concurrent_request_uses_pinned_input_ids(monkeypatch) -> None:
@@ -61,10 +174,12 @@ def test_concurrent_request_uses_pinned_input_ids(monkeypatch) -> None:
         threading.Barrier(1),
         True,
         False,
+        request_timeout_seconds=3600,
     )
 
     assert captured["json"]["input_ids"] == [11, 22, 33]
     assert "text" not in captured["json"]
+    assert captured["timeout"] == 3600
 
 
 def test_concurrent_request_compacts_cumulative_intermediate_outputs(monkeypatch) -> None:
@@ -366,6 +481,63 @@ def test_summary_rejects_group_without_fully_active_interval() -> None:
 
     with pytest.raises(ValueError, match="concurrency 2 never became fully active"):
         summarize([group])
+
+
+def test_summary_can_report_provider_latency_without_fully_active_interval() -> None:
+    requests = []
+    for slot, elapsed_ms in enumerate((10.0, 20.0)):
+        request = make_request(slot, f"output-{slot}")
+        request.update(
+            e2e_ms=elapsed_ms,
+            time_to_first_token_ms=elapsed_ms,
+            inter_token_ms=[],
+            completion_token_deltas=[1],
+            standard_completion_tokens=1,
+            standard_output_speed_after_first_token=None,
+        )
+        request["chunks"][0]["elapsed_ms"] = elapsed_ms
+        request["chunks"][0]["response"]["meta_info"]["server_batch_size"] = 1
+        requests.append(request)
+    group = {
+        "concurrency": 2,
+        "requests": requests,
+        "throughput_tokens_per_second": 100.0,
+        "standard_throughput_tokens_per_second": 100.0,
+    }
+
+    result = summarize([group], require_fully_active=False)["2"]
+
+    assert result["server_full_batch_observed"] is False
+    assert result["fully_active_repetitions"] == 0
+    assert result["max_server_batch_size"] == 1
+    assert result["fully_active_model_step_median_ms"] is None
+    assert result["fully_active_throughput_median_tokens_per_second"] is None
+
+
+def test_summary_omits_output_stability_for_distinct_prompt_cases() -> None:
+    request = make_request(0, "unique-output")
+    request.update(
+        e2e_ms=20.0,
+        time_to_first_token_ms=10.0,
+        inter_token_ms=[],
+        completion_token_deltas=[1],
+        standard_completion_tokens=1,
+        standard_output_speed_after_first_token=None,
+    )
+    request["chunks"][0]["elapsed_ms"] = 10.0
+    group = {
+        "concurrency": 1,
+        "requests": [request],
+        "throughput_tokens_per_second": 50.0,
+        "standard_throughput_tokens_per_second": 50.0,
+    }
+
+    result = summarize(
+        [group], require_fully_active=False, comparable_outputs=False
+    )["1"]
+
+    assert result["output_multiset_stable"] is None
+    assert result["slot_output_mapping_stable"] is None
 
 
 def test_summary_rejects_client_overlap_without_full_server_batch() -> None:
