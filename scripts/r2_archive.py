@@ -376,22 +376,30 @@ def cleanup(args):
     client, _ = client_for(args.credentials)
     root = Path(reference["source_absolute_path"])
     expected = json.loads((args.work.resolve() / "inventory.json").read_text())
-    if inventory(root) != expected:
-        raise RuntimeError("SOURCE_CHANGED_SINCE_ARCHIVE: re-run upload into a new prefix before cleanup")
+    current = inventory(root)
+    if current != expected:
+        archived = {e["path"]: e for e in expected}
+        changed = [
+            e["path"]
+            for e in current
+            if e["path"] not in archived or (not stat.S_ISDIR(e["mode"]) and archived[e["path"]] != e)
+        ]
+        if changed:
+            raise RuntimeError(f"SOURCE_CHANGED_SINCE_ARCHIVE: re-run upload into a new prefix before cleanup: {changed[:5]}")
+        log("resuming_interrupted_cleanup", remaining_entries=len(current))
     objects = verify_remote(client, reference)
     free_before = shutil.disk_usage(root).free
-    removed = 0
     for child in sorted(root.iterdir()):
         if child.is_dir() and not child.is_symlink():
-            removed += sum(len(files) for _, _, files in os.walk(child))
+            for directory, _, _ in os.walk(child):
+                os.chmod(directory, os.lstat(directory).st_mode | stat.S_IRWXU)
             shutil.rmtree(child)
         else:
             child.unlink()
-            removed += 1
     reference["local_cleanup"] = {
         "deleted_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "source": str(root),
-        "removed_files_and_symlinks": removed,
+        "removed_files_and_symlinks": sum(not stat.S_ISDIR(e["mode"]) for e in expected),
         "remote_objects_reverified": objects,
         "free_bytes_before": free_before,
         "free_bytes_after": shutil.disk_usage(root).free,
