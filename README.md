@@ -3,6 +3,10 @@
 This repository is our working implementation and benchmark suite for running
 Inkling-Small on TPU7x with SGLang-JAX and DSpark speculative decoding.
 
+Experiment traces, profiles, and receipts that were in the untracked
+`autoresearch/` directory are archived in R2; see
+[Archived autoresearch artifacts](#archived-autoresearch-artifacts).
+
 ## What works
 
 - Inkling-Small target inference on eight TPU7x devices.
@@ -86,3 +90,24 @@ There are two credible performance projects left:
 Long-context prompt processing, admission behavior, API reliability, and KV
 movement are important serving work, but they are separate from steady-decode
 throughput.
+
+## Archived autoresearch artifacts
+
+`autoresearch/` is not tracked by Git. Its September 25, 2026 contents (3,657 files, 58.6 GiB) are in the private R2 bucket `inkle-archives` under `autoresearch/2026-09-25/`, stored as 35 independently restorable `tar.zst` parts (10.4 GiB). [archives/autoresearch-2026-09-25.json](archives/autoresearch-2026-09-25.json) records the endpoint, each part's SHA-256 and R2 ETag, a byte-identical restore check, and the local deletion receipt. The local copies were deleted after every object was re-verified. Check `archives/` before assuming an experiment's traces or receipts are missing or rerunning it to recover them.
+
+Credentials come from `~/.config/axport/r2.env` on the owner's Mac; elsewhere pass `--credentials` with `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, and `R2_SECRET_ACCESS_KEY`. Restoring needs `zstd` and writes into a new directory using the original `autoresearch/`-relative paths:
+
+```sh
+uv run scripts/r2_archive.py restore --reference archives/autoresearch-2026-09-25.json --list --prefix dspark-correction-20260819/
+uv run scripts/r2_archive.py restore --reference archives/autoresearch-2026-09-25.json \
+  --prefix dspark-correction-20260819/ --destination /path/to/new-dir
+```
+
+New experiments are not uploaded automatically. When `autoresearch/` grows, archive it into a new dated prefix, commit the new reference, then remove the local copy:
+
+```sh
+uv run scripts/r2_archive.py upload --source autoresearch --bucket inkle-archives \
+  --prefix autoresearch/YYYY-MM-DD --reference archives/autoresearch-YYYY-MM-DD.json \
+  --repo https://github.com/sdrshn-nmbr/inkle --relative-path autoresearch
+uv run scripts/r2_archive.py cleanup --reference archives/autoresearch-YYYY-MM-DD.json
+```

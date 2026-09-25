@@ -1,0 +1,325 @@
+{
+  "schema_version": 1,
+  "status": "verified",
+  "bucket": "inkle-archives",
+  "prefix": "autoresearch/2026-09-25",
+  "endpoint": "https://d1236c0762602db757c07d291cc3c4fa.r2.cloudflarestorage.com",
+  "source_repo": "https://github.com/sdrshn-nmbr/inkle",
+  "source_relative_path": "autoresearch",
+  "source_absolute_path": "/Users/sudarshan/Code/inkle/autoresearch",
+  "source_given_path": "/Users/sudarshan/Code/inkle/autoresearch",
+  "created_utc": "2026-09-25T04:56:57Z",
+  "regular_files": 3657,
+  "entries": 4393,
+  "source_file_bytes": 62881907211,
+  "archive_bytes": 11146065547,
+  "verification": "Every archive: local SHA-256 and independently computed multipart MD5 ETag; R2 HEAD size, ETag and SHA-256 metadata matched. Source path/size/mtime/mode inventory unchanged before and after packing.",
+  "file_index": {
+    "key": "autoresearch/2026-09-25/files.jsonl.zst",
+    "bytes": 79059,
+    "sha256": "8cf5a0e944bf0421a51385919e305a76c017b46b03f63105e0b264045eecab4b",
+    "etag": "ba42c04f52813494b0e0dd480ca9f9ae"
+  },
+  "archives": [
+    {
+      "key": "autoresearch/2026-09-25/parts/part-0000.tar.zst",
+      "bytes": 285914006,
+      "sha256": "244086a196a0ec65c34fa33869121b2ed6dab6a91093957a9f1094374aea9ed4",
+      "etag": "18d7772566a5a1365320d1c6d461b774-5",
+      "entries": 29,
+      "source_file_bytes": 1961555558
+    },
+    {
+      "key": "autoresearch/2026-09-25/parts/part-0001.tar.zst",
+      "bytes": 195071289,
+      "sha256": "673cad68ab7392b96f22c7002c76b5aaccaf8f7090398c6c886e236baf05b5ff",
+      "etag": "b809267bcfac19b0bd9b9ccbeb23ece9-3",
+      "entries": 34,
+      "source_file_bytes": 1872106518
+    },
+    {
+      "key": "autoresearch/2026-09-25/parts/part-0002.tar.zst",
+      "bytes": 307047700,
+      "sha256": "2c2085eda1562c136a657deba8e1b79eaac940a923995f8f0abc5ca464169974",
+      "etag": "31aa2f91c39c5b5b574fcda26b78a6bc-5",
+      "entries": 48,
+      "source_file_bytes": 1786804166
+    },
+    {
+      "key": "autoresearch/2026-09-25/parts/part-0003.tar.zst",
+      "bytes": 81297679,
+      "sha256": "5a9e85542de7fe7180962645f810fde637b46dc750b75a3973fc161002bcd4bc",
+      "etag": "535e017188dc6cb25744f9c9ada8ad22-2",
+      "entries": 29,
+      "source_file_bytes": 1310326245
+    },
+    {
+      "key": "autoresearch/2026-09-25/parts/part-0004.tar.zst",
+      "bytes": 133558686,
+      "sha256": "5da03c7ab3a12486715d9cd4b3886213c1b621ef12befa77e3a4b7c8fc389c57",
+      "etag": "bcd54afecb46d70dd97dad70638bb71d-2",
+      "entries": 128,
+      "source_file_bytes": 2013680977
+    },
+    {
+      "key": "autoresearch/2026-09-25/parts/part-0005.tar.zst",
+      "bytes": 42678776,
+      "sha256": "31edafe7e79a907a475719d254b9c0b38180a4adf6ba1bff78c6ec84aa4e92c2",
+      "etag": "7ae152fc14b9de41ee7608190efa35d5",
+      "entries": 21,
+      "source_file_bytes": 2146739869
+    },
+    {
+      "key": "autoresearch/2026-09-25/parts/part-0006.tar.zst",
+      "bytes": 261694531,
+      "sha256": "6c4757f8988a0ae493210186126a5548cd88c0a58c5c60e44c15c38e3edd3821",
+      "etag": "13d33a0c381b19f1bbf24446142d15db-4",
+      "entries": 122,
+      "source_file_bytes": 1669656571
+    },
+    {
+      "key": "autoresearch/2026-09-25/parts/part-0007.tar.zst",
+      "bytes": 87787004,
+      "sha256": "17269b719ba6c2d80ac55e017109879721fa970a1685079f476be437434e4ff1",
+      "etag": "416a67de77c4ca37864594e7c1269642-2",
+      "entries": 95,
+      "source_file_bytes": 1505276773
+    },
+    {
+      "key": "autoresearch/2026-09-25/parts/part-0008.tar.zst",
+      "bytes": 300002341,
+      "sha256": "917f42534780e40fa6b02902a4aa4c66c460af9019b5211c17ba459f8e8d0336",
+      "etag": "3795b360aa2eaf81725f4ea17e3981b9-5",
+      "entries": 113,
+      "source_file_bytes": 2142591165
+    },
+    {
+      "key": "autoresearch/2026-09-25/parts/part-0009.tar.zst",
+      "bytes": 612189734,
+      "sha256": "6f823a7d349f24ee2ba88bfca7f9a95b420273b6830d663778d4a8c3c738739e",
+      "etag": "e2bca6bba3f87c33494b2946c712593e-10",
+      "entries": 82,
+      "source_file_bytes": 1741626931
+    },
+    {
+      "key": "autoresearch/2026-09-25/parts/part-0010.tar.zst",
+      "bytes": 948361196,
+      "sha256": "46c375ce74c20e3a4f117139254f00ad8c5a328eb902fa2677e2a9527761316c",
+      "etag": "6c8fccec0482b0bc26d2784240caf411-15",
+      "entries": 96,
+      "source_file_bytes": 2145962915
+    },
+    {
+      "key": "autoresearch/2026-09-25/parts/part-0011.tar.zst",
+      "bytes": 1218311436,
+      "sha256": "d61054d23562b79221883ce02c860a00bb428c0a2f48ae11a5628f1fe0334ae9",
+      "etag": "2a9680d5d1cdf0f7ccdf7b95efb0483b-19",
+      "entries": 43,
+      "source_file_bytes": 1943815929
+    },
+    {
+      "key": "autoresearch/2026-09-25/parts/part-0012.tar.zst",
+      "bytes": 866952831,
+      "sha256": "5816b315b7dcf101c8d6574e88ddcd41fa3fcb3f57f0a4d31fc1d08db5ce3cf9",
+      "etag": "7f32e5c2a3f0ed25dc50a84a3487848e-13",
+      "entries": 126,
+      "source_file_bytes": 1781639609
+    },
+    {
+      "key": "autoresearch/2026-09-25/parts/part-0013.tar.zst",
+      "bytes": 10362469,
+      "sha256": "3ea1f254c7bcc76efc1cf4595409d3d0fe6c7a7ce55e1fcccd844e9d70fff840",
+      "etag": "1938889a85ad244fc9a57bfe600c37e8",
+      "entries": 1,
+      "source_file_bytes": 1319151418
+    },
+    {
+      "key": "autoresearch/2026-09-25/parts/part-0014.tar.zst",
+      "bytes": 13832567,
+      "sha256": "32000ab3969df763c47e0a11d69ff1b287f8f677202e68a8afce074fd04196f9",
+      "etag": "6ebb450dc498cb4aa57c922273673c88",
+      "entries": 7,
+      "source_file_bytes": 1760149216
+    },
+    {
+      "key": "autoresearch/2026-09-25/parts/part-0015.tar.zst",
+      "bytes": 13747974,
+      "sha256": "b7cfa07c400b65aa85ce9471a5d2ca0fac8a58cb379287d3df82f32bee1baac4",
+      "etag": "bb93632feb2deb229db3370404f4bc84",
+      "entries": 4,
+      "source_file_bytes": 1754914892
+    },
+    {
+      "key": "autoresearch/2026-09-25/parts/part-0016.tar.zst",
+      "bytes": 32322699,
+      "sha256": "788acf6e1f680afe6e167ccf5a2c73cdc2bbd33f041a301d994fb474daf581e7",
+      "etag": "fe1ceba229096329894ea728fd1e0706",
+      "entries": 23,
+      "source_file_bytes": 1347656742
+    },
+    {
+      "key": "autoresearch/2026-09-25/parts/part-0017.tar.zst",
+      "bytes": 186259622,
+      "sha256": "efca3445b711055e221457a728ced866fc6f2459d38372a92febd0fd0d4582ff",
+      "etag": "819ca5425e08c2427226c2df0184a863-3",
+      "entries": 155,
+      "source_file_bytes": 1989775950
+    },
+    {
+      "key": "autoresearch/2026-09-25/parts/part-0018.tar.zst",
+      "bytes": 315061951,
+      "sha256": "a802ac799c43d453ddf912d665d2db231efdcaa1b339655158f858d63544b0bc",
+      "etag": "31f2944c58e1237d9727f6d56882cbe6-5",
+      "entries": 157,
+      "source_file_bytes": 2038840323
+    },
+    {
+      "key": "autoresearch/2026-09-25/parts/part-0019.tar.zst",
+      "bytes": 432032871,
+      "sha256": "95d157ac29f75d17d29a155a423771649b21546007b53d4a1180c149a7b80ef0",
+      "etag": "979258eacc63d461b457b76d0b85f8ef-7",
+      "entries": 19,
+      "source_file_bytes": 805299171
+    },
+    {
+      "key": "autoresearch/2026-09-25/parts/part-0020.tar.zst",
+      "bytes": 73532319,
+      "sha256": "474f8d071175aa613d449e44db7922e4a2a93ff65301fc381c646f30b2b511e5",
+      "etag": "66b4f0006c5505d279878b514bdb0feb-2",
+      "entries": 1,
+      "source_file_bytes": 1499908647
+    },
+    {
+      "key": "autoresearch/2026-09-25/parts/part-0021.tar.zst",
+      "bytes": 122643391,
+      "sha256": "e1035d316be74ecd08c914ee848f4f8228fd07c3f08b7f7f8945565ba9bc5e21",
+      "etag": "d4ea05e2413f5865b37ccbc4bf4c9ec6-2",
+      "entries": 4,
+      "source_file_bytes": 2024475603
+    },
+    {
+      "key": "autoresearch/2026-09-25/parts/part-0022.tar.zst",
+      "bytes": 57138649,
+      "sha256": "1cb5d03285ea233e0e568266b99f9f0669ffbd96cb17c1ecda05034c7f0831dd",
+      "etag": "cc90bb04f853e7212f0cb08219a916d4",
+      "entries": 13,
+      "source_file_bytes": 1950473196
+    },
+    {
+      "key": "autoresearch/2026-09-25/parts/part-0023.tar.zst",
+      "bytes": 542152996,
+      "sha256": "6cec460e7ccce2859c700d5f3b9fdbaa3e7f7901ae305b2ab1f4b4e8c51fd19a",
+      "etag": "815d35d887da97c7f848d6c0e659c59c-9",
+      "entries": 1718,
+      "source_file_bytes": 2051471508
+    },
+    {
+      "key": "autoresearch/2026-09-25/parts/part-0024.tar.zst",
+      "bytes": 369645440,
+      "sha256": "cef77b3ae7706eabac0df4c94ae505f02dcab048a16fd7eba37485517f0d9534",
+      "etag": "4499be2a9f63ac23be85edf4833b2d3b-6",
+      "entries": 68,
+      "source_file_bytes": 2011566605
+    },
+    {
+      "key": "autoresearch/2026-09-25/parts/part-0025.tar.zst",
+      "bytes": 1046184220,
+      "sha256": "4c93a2ddbfe9aadc1217ae90822b4de954ed7f81bb857e1980911e6979fb31dd",
+      "etag": "70041558d55da1a5279a126a491195eb-16",
+      "entries": 151,
+      "source_file_bytes": 2147310417
+    },
+    {
+      "key": "autoresearch/2026-09-25/parts/part-0026.tar.zst",
+      "bytes": 281353922,
+      "sha256": "e2ef5dbae4c9b37115bf77fdb8117ce0f78e9304c9e83bf32d31073ea6898960",
+      "etag": "954396919beffaaf9d5c32d7d24888d7-5",
+      "entries": 220,
+      "source_file_bytes": 2105517065
+    },
+    {
+      "key": "autoresearch/2026-09-25/parts/part-0027.tar.zst",
+      "bytes": 202119736,
+      "sha256": "a8cefec979f4b2e34543932421c4fbc7bc8ebfc6d437ba2ec3418131f95e5ef9",
+      "etag": "21dad803824a271df22ed25b9b7671e6-4",
+      "entries": 197,
+      "source_file_bytes": 1904803233
+    },
+    {
+      "key": "autoresearch/2026-09-25/parts/part-0028.tar.zst",
+      "bytes": 107359406,
+      "sha256": "2a3be065a4b275d3218484aed79c42e06e1d0490af96e9a84cae2bb218b36358",
+      "etag": "f9397c450fb588767e6fc148f58e556c-2",
+      "entries": 43,
+      "source_file_bytes": 1316724333
+    },
+    {
+      "key": "autoresearch/2026-09-25/parts/part-0029.tar.zst",
+      "bytes": 48111111,
+      "sha256": "fd401b0c03ac3dadd22a81c9f5e392509102dc1ba44664d72f72f2c482a3b0ee",
+      "etag": "306bcfb3ba610db0f9e0b89fb9bce47d",
+      "entries": 21,
+      "source_file_bytes": 1555628713
+    },
+    {
+      "key": "autoresearch/2026-09-25/parts/part-0030.tar.zst",
+      "bytes": 264501139,
+      "sha256": "b6b6489735f769bea88a654bc8101866fa4d8a08dc77b5eea353d294510e20c6",
+      "etag": "780fa3dd0a87fe5e2f7e06c03b6dabb0-4",
+      "entries": 22,
+      "source_file_bytes": 2109285180
+    },
+    {
+      "key": "autoresearch/2026-09-25/parts/part-0031.tar.zst",
+      "bytes": 350131887,
+      "sha256": "737e066db3caf184c08943a22f496b18e26406aa5333eeb99f8b5448a6921bc2",
+      "etag": "a26e17fab0a0355e3af78adbdf780488-6",
+      "entries": 278,
+      "source_file_bytes": 2124502441
+    },
+    {
+      "key": "autoresearch/2026-09-25/parts/part-0032.tar.zst",
+      "bytes": 697101492,
+      "sha256": "d4d4cbb5ac876daae26f8d36cf72bff936609f9a70ac67166131e78f5805a8f4",
+      "etag": "6af6e9cee1eeacb100ceecab1e761148-11",
+      "entries": 198,
+      "source_file_bytes": 2043013325
+    },
+    {
+      "key": "autoresearch/2026-09-25/parts/part-0033.tar.zst",
+      "bytes": 452363711,
+      "sha256": "8106b8fb860744291039b61fae3124f099cd7aec876cd223a00f37c0e6eb7bb0",
+      "etag": "0471cfd21a105ea44bcfa05771a7cb18-7",
+      "entries": 80,
+      "source_file_bytes": 2136916864
+    },
+    {
+      "key": "autoresearch/2026-09-25/parts/part-0034.tar.zst",
+      "bytes": 187238766,
+      "sha256": "79031b905a824cb94ab77ec06acaaee22da525d374f82ba5d2be3e7e3804aa19",
+      "etag": "f5694fd672eb14fd7baa6b3022b9c91f-3",
+      "entries": 47,
+      "source_file_bytes": 862739143
+    }
+  ],
+  "local_cleanup": {
+    "deleted_at": "2026-09-25T05:00:39Z",
+    "source": "/Users/sudarshan/Code/inkle/autoresearch",
+    "removed_files_and_symlinks": 3657,
+    "remote_objects_reverified": 37,
+    "free_bytes_before": 324058095616,
+    "free_bytes_after": 386953785344
+  },
+  "archive_manifest": {
+    "key": "autoresearch/2026-09-25/manifest.json",
+    "bytes": 11502,
+    "sha256": "b342c1d59ee90784184e75ac75322eeaf7c0b14072a1dd4c03c562e3264f0ec1",
+    "etag": "836455cb5a0f1ba60f3bc95c6f05203d"
+  },
+  "restore_smoke_test": {
+    "at": "2026-09-25T04:59:00Z",
+    "prefix": "packed-nvfp4-20260820/v7x-native-microgate/profile/native-float4-hlo/",
+    "restored_files": 140,
+    "result": "restored bytes identical to the local source (diff -r) before cleanup"
+  }
+}
